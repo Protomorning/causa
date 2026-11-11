@@ -1,0 +1,26 @@
+# Build output
+build/
+build-cmake/
+*.obj
+*.o
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# The Python extension
+*.pyd
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Files the tests write
+*.bin
+test_output.txt
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
