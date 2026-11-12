@@ -86,4 +86,12 @@
     #endif
 #endif
 
+// The largest number of variables a model can hold, and the largest number
+// of causes one variable can have.
+//
+// These are here rather than in the causal header because the memory uses
+// them as well: a model is built out of what the memory learned.
+#define CAUSA_MAX_VARIABLES 64
+#define CAUSA_MAX_PARENTS 16
+
 #endif

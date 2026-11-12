@@ -2263,6 +2263,205 @@ void test_intervention_planning() {
     printf("PASS: intervention planning\n");
 }
 
+// A goal that needs several variables changed at once.
+//
+// The plan has to act on more than one variable, and it has to act on both
+// of them: reaching one goal and missing the other would be no use.
+void test_intervention_planning_several_goals() {
+    printf("Testing intervention planning with several goals...\n"); fflush(stdout);
+    causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+
+    const int32_t D = 3;
+
+    causa_memory_config_t mcfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+    mcfg.capacity[CAUSA_MEMORY_WORKING] = 16;
+    mcfg.capacity[CAUSA_MEMORY_EPISODIC] = 512;
+    mcfg.capacity[CAUSA_MEMORY_SEMANTIC] = 64;
+    mcfg.capacity[CAUSA_MEMORY_PROCEDURAL] = 32;
+    mcfg.key_dim = D;
+    mcfg.value_dim = D;
+    mcfg.working_decay_rate = 0.0f;
+    mcfg.episodic_decay_rate = 0.0f;
+
+    causa_memory_t* mem = causa_memory_new(arena, backend, &mcfg);
+    if (!mem) { test_fail("memory creation\n"); return; }
+
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_F32;
+    opts.device = CAUSA_DEVICE_CPU;
+    int64_t shape[] = {D};
+
+    // Two separate chains, so that reaching one goal does not move the
+    // other: x0 -> x1 and x2 on its own.
+    unsigned int seed = 97531u;
+    for (int i = 0; i < 400; i++) {
+        float r[3];
+        for (int j = 0; j < 3; j++) {
+            seed = seed * 1103515245u + 12345u;
+            r[j] = ((float)((seed >> 16) & 0x7fff) / 16384.0f) - 1.0f;
+        }
+        float x0 = r[0];
+        float x1 = 1.5f * x0 + 0.5f + 0.25f * r[1];
+        float x2 = 3.0f * r[2];
+
+        causa_tensor_t* key = causa_tensor_new(arena, backend, shape, 1, &opts);
+        causa_tensor_t* value = causa_tensor_new(arena, backend, shape, 1, &opts);
+        float* kd = (float*)key->data;
+        float* vd = (float*)value->data;
+        kd[0] = x0; kd[1] = x1; kd[2] = x2;
+        vd[0] = x1; vd[1] = x2; vd[2] = 0.0f;
+
+        causa_memory_write(mem, key, value, CAUSA_MEMORY_EPISODIC);
+    }
+
+    causa_config_t ccfg = CAUSA_CONFIG_DEFAULTS;
+    ccfg.discovery_alpha = 0.05f;
+    ccfg.discovery_threshold = 0.25f;
+    ccfg.max_iterations = 300;
+
+    causa_scm_t* scm = causa_scm_new(arena, backend, &ccfg);
+    int32_t laws = causa_memory_consolidate_causal(mem, scm, &ccfg);
+    if (laws <= 0) {
+        test_fail("consolidation produced %d laws\n", laws);
+        return;
+    }
+
+    causa_tensor_t* state = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* goal = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* plan = causa_tensor_new(arena, backend, shape, 1, &opts);
+
+    float* sd = (float*)state->data;
+    sd[0] = 1.0f; sd[1] = NAN; sd[2] = NAN;
+
+    // Two goals at once: x1 should be 4 and x2 should be 9.
+    float* gd = (float*)goal->data;
+    gd[0] = NAN; gd[1] = 4.0f; gd[2] = 9.0f;
+
+    int32_t count = 0;
+    if (causa_memory_plan_intervention(mem, state, goal, plan, &count) != 0) {
+        test_fail("the intervention could not be planned\n");
+        return;
+    }
+
+    float* pd = (float*)plan->data;
+    printf("  plan: change x0 by %f, x1 by %f, x2 by %f\n", pd[0], pd[1], pd[2]);
+
+    // Both goals have to be reached, so the plan has to act on more than one
+    // variable.
+    if (count < 2) {
+        test_fail("the plan acts on %d variables, expected at least 2\n", count);
+        return;
+    }
+
+    // x1 follows from x0, so it is x0 that moves. x1 stands at
+    // 1.5 * 1 + 0.5 = 2, and it has to reach 4, so x0 moves by
+    // (4 - 2) / 1.5 = 1.333.
+    float x1_after = 1.5f * (1.0f + pd[0]) + 0.5f;
+    printf("  applying the plan puts x1 at %f and x2 at %f\n", x1_after, pd[2]);
+    if (fabsf(x1_after - 4.0f) > 0.4f) {
+        test_fail("the plan puts x1 at %f, expected about 4\n", x1_after);
+        return;
+    }
+
+    // x2 has no cause, so it is set directly.
+    if (fabsf(pd[2] - 9.0f) > 1.5f) {
+        test_fail("the plan says x2 moves by %f, expected about 9\n", pd[2]);
+        return;
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    printf("PASS: intervention planning with several goals\n");
+}
+
+// A counterfactual kept in memory.
+//
+// The counterfactual has to be found again for the variable it answers, and
+// not for the others. Were the query variable ignored, a question about one
+// variable would be answered with another's result.
+void test_counterfactuals_in_memory() {
+    printf("Testing counterfactuals in memory...\n"); fflush(stdout);
+    causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+
+    const int32_t D = 3;
+
+    causa_memory_config_t mcfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+    mcfg.capacity[CAUSA_MEMORY_WORKING] = 16;
+    mcfg.capacity[CAUSA_MEMORY_EPISODIC] = 64;
+    mcfg.capacity[CAUSA_MEMORY_SEMANTIC] = 16;
+    mcfg.capacity[CAUSA_MEMORY_PROCEDURAL] = 16;
+    mcfg.key_dim = D;
+    mcfg.value_dim = D;
+
+    causa_memory_t* mem = causa_memory_new(arena, backend, &mcfg);
+    if (!mem) { test_fail("memory creation\n"); return; }
+
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_F32;
+    opts.device = CAUSA_DEVICE_CPU;
+    int64_t shape[] = {D};
+
+    causa_tensor_t* context = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* result_x1 = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* result_x2 = causa_tensor_new(arena, backend, shape, 1, &opts);
+    if (!context || !result_x1 || !result_x2) {
+        test_fail("tensor creation\n");
+        return;
+    }
+
+    ((float*)context->data)[0] = 2.0f;
+    ((float*)context->data)[1] = 3.5f;
+    ((float*)context->data)[2] = 0.0f;
+
+    ((float*)result_x1->data)[0] = 8.0f;
+    ((float*)result_x2->data)[0] = 15.75f;
+
+    if (causa_memory_keep_counterfactual(mem, "x1", context, result_x1) < 0) {
+        test_fail("the counterfactual was not kept\n");
+        return;
+    }
+    if (causa_memory_keep_counterfactual(mem, "x2", context, result_x2) < 0) {
+        test_fail("the counterfactual was not kept\n");
+        return;
+    }
+
+    // Asking about one variable must give that variable's answer and not the
+    // other's.
+    causa_tensor_t* found[4];
+    int32_t n = causa_memory_find_counterfactuals(mem, "x1", context, 4, found);
+    if (n != 1) {
+        test_fail("found %d counterfactuals for x1, expected 1\n", n);
+        return;
+    }
+    if (fabsf(((float*)found[0]->data)[0] - 8.0f) > 1e-5f) {
+        test_fail("the counterfactual for x1 is wrong\n");
+        return;
+    }
+
+    n = causa_memory_find_counterfactuals(mem, "x2", context, 4, found);
+    if (n != 1) {
+        test_fail("found %d counterfactuals for x2, expected 1\n", n);
+        return;
+    }
+    if (fabsf(((float*)found[0]->data)[0] - 15.75f) > 1e-5f) {
+        test_fail("the counterfactual for x2 is wrong\n");
+        return;
+    }
+
+    // A variable that was never asked about has no counterfactuals.
+    n = causa_memory_find_counterfactuals(mem, "x3", context, 4, found);
+    if (n != 0) {
+        test_fail("found %d counterfactuals for x3, expected none\n", n);
+        return;
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    printf("PASS: counterfactuals in memory\n");
+}
+
 void test_tensor_views_and_dtypes() {
     printf("Testing views and element types...\n"); fflush(stdout);
     causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
@@ -2660,6 +2859,1116 @@ void test_gradients() {
     printf("PASS: gradients\n");
 }
 
+// The kernels have to work on every element type.
+//
+// The arithmetic kernels were written for float32 only, and a tensor of
+// another type came back with whatever the arena held in it. The values
+// below are the ones a float32 tensor would give.
+void test_dtype_kernels() {
+    printf("Testing kernels on other element types...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // The sum of four doubles is ten.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F64;
+        int64_t shape[] = {4};
+        causa_tensor_t* d = causa_tensor_new(arena, backend, shape, 1, &opts);
+        if (!d) {
+            test_fail("a double tensor could not be made\n");
+            failed = true;
+        } else {
+            double* dd = (double*)d->data;
+            for (int i = 0; i < 4; i++) dd[i] = (double)(i + 1);
+
+            int32_t dims[] = {0};
+            causa_tensor_t* r = causa_tensor_reduce(d, CAUSA_REDUCE_SUM, dims, 1, false);
+            if (!r) {
+                test_fail("the reduction of a double tensor failed\n");
+                failed = true;
+            } else {
+                double v = ((const double*)r->data)[0];
+                if (fabs(v - 10.0) > 1e-9) {
+                    test_fail("the sum of the doubles is %g, expected 10\n", v);
+                    failed = true;
+                }
+            }
+        }
+    }
+
+    // A batched product of doubles gives the same answer as the float one.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F64;
+        int64_t shape[] = {2, 2, 2};
+        causa_tensor_t* a = causa_tensor_new(arena, backend, shape, 3, &opts);
+        causa_tensor_t* b = causa_tensor_new(arena, backend, shape, 3, &opts);
+        if (!a || !b) {
+            test_fail("the double tensors could not be made\n");
+            failed = true;
+        } else {
+            double* ad = (double*)a->data;
+            double* bd = (double*)b->data;
+            for (int i = 0; i < 8; i++) { ad[i] = 1.0; bd[i] = 2.0; }
+
+            causa_tensor_t* c = causa_tensor_bmm(a, b);
+            if (!c) {
+                test_fail("the batched product of doubles failed\n");
+                failed = true;
+            } else {
+                double v = ((const double*)c->data)[0];
+                if (fabs(v - 4.0) > 1e-9) {
+                    test_fail("the batched product of doubles is %g, expected 4\n", v);
+                    failed = true;
+                }
+            }
+        }
+    }
+
+    // The backend product has to agree with the general one. The backend
+    // read the strides as if they were element counts, so it stepped four
+    // times too far and gave a different answer.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        int64_t shape[] = {2, 2};
+        causa_tensor_t* a = causa_tensor_new(arena, backend, shape, 2, &opts);
+        causa_tensor_t* b = causa_tensor_new(arena, backend, shape, 2, &opts);
+        float* af = (float*)a->data;
+        float* bf = (float*)b->data;
+        for (int i = 0; i < 4; i++) { af[i] = (float)(i + 1); bf[i] = (float)(i + 5); }
+
+        causa_tensor_t* via_tensor = causa_tensor_matmul(a, b);
+        causa_tensor_t* via_backend = causa_backend_matmul(backend, a, b);
+        if (!via_tensor || !via_backend) {
+            test_fail("the matrix products failed\n");
+            failed = true;
+        } else {
+            const float* t = (const float*)via_tensor->data;
+            const float* k = (const float*)via_backend->data;
+            for (int i = 0; i < 4; i++) {
+                if (fabsf(t[i] - k[i]) > 1e-5f) {
+                    test_fail("the backend product is %g where the general one is %g\n", k[i], t[i]);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // A number of groups that is not a positive count would divide by
+    // zero, so it is refused.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        int64_t shape[] = {1, 2, 4};
+        int64_t wshape[] = {2, 2, 3};
+        causa_tensor_t* input = causa_tensor_new(arena, backend, shape, 3, &opts);
+        causa_tensor_t* w = causa_tensor_new(arena, backend, wshape, 3, &opts);
+        if (!input || !w) {
+            test_fail("the convolution tensors could not be made\n");
+            failed = true;
+        } else if (causa_tensor_conv1d(input, w, NULL, 1, 0, 1, 0)) {
+            test_fail("a convolution with no groups was accepted\n");
+            failed = true;
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: kernels on other element types\n");
+}
+
+// Write a tensor file with a given shape and strides.
+//
+// The file is written by hand rather than through the writer, because the
+// point of the test is a file that the writer would never make: strides
+// that point outside the buffer, and a shape whose count of elements
+// overflows.
+static void write_raw_tensor_file(const char* path, uint32_t dtype,
+                                   int64_t ndim, const int64_t* shape,
+                                   const int64_t* strides, uint64_t nbytes) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+
+    uint32_t magic = CAUSA_IO_MAGIC;
+    uint32_t version = CAUSA_IO_VERSION;
+    uint32_t section = CAUSA_IO_SECTION_TENSORS;
+    uint32_t count = 1;
+    uint32_t device = CAUSA_DEVICE_CPU;
+    uint32_t layout = CAUSA_LAYOUT_CONTIGUOUS;
+    uint8_t flag = 0;
+    uint32_t name_len = 0;
+
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&section, sizeof(section), 1, f);
+    fwrite(&count, sizeof(count), 1, f);
+
+    fwrite(&dtype, sizeof(dtype), 1, f);
+    fwrite(&device, sizeof(device), 1, f);
+    fwrite(&layout, sizeof(layout), 1, f);
+    fwrite(&ndim, sizeof(ndim), 1, f);
+    for (int32_t i = 0; i < ndim; i++) fwrite(&shape[i], sizeof(int64_t), 1, f);
+    for (int32_t i = 0; i < ndim; i++) fwrite(&strides[i], sizeof(int64_t), 1, f);
+    int64_t offset = 0;
+    fwrite(&offset, sizeof(offset), 1, f);
+    fwrite(&flag, sizeof(flag), 1, f);
+    fwrite(&name_len, sizeof(name_len), 1, f);
+    fwrite(&nbytes, sizeof(nbytes), 1, f);
+    for (uint64_t i = 0; i < nbytes; i++) {
+        uint8_t zero = 0;
+        fwrite(&zero, sizeof(zero), 1, f);
+    }
+    fwrite(&flag, sizeof(flag), 1, f);
+
+    fclose(f);
+}
+
+// A file that describes a tensor the reader cannot make has to be refused.
+//
+// The strides say where each element sits, so a file that claims a stride
+// of a billion would make every kernel read outside the buffer. A shape
+// whose count of elements overflows would ask for a buffer of four bytes
+// and a tensor of four thousand million million elements.
+void test_serialization_refuses_bad_geometry() {
+    printf("Testing serialization (a file with a bad geometry is refused)...\n"); fflush(stdout);
+
+    causa_backend_t* backend = causa_backend_cpu_new();
+    const char* path = "test_geometry.bin";
+    bool failed = false;
+
+    // Strides that point outside the buffer.
+    {
+        int64_t shape[] = {4};
+        int64_t strides[] = {1LL << 40};
+        write_raw_tensor_file(path, CAUSA_DTYPE_F32, 1, shape, strides, 16);
+
+        causa_arena_t* arena = causa_arena_new(1024 * 1024);
+        causa_reader_t* r = causa_reader_open(path);
+        causa_tensor_t* t = r ? causa_read_tensor(r, arena, backend) : NULL;
+        if (t) {
+            test_fail("a file with absurd strides was accepted\n");
+            failed = true;
+        }
+        if (r) causa_reader_close(r);
+        causa_arena_free(arena);
+    }
+
+    // A shape whose count of elements overflows.
+    {
+        int64_t shape[] = {(1LL << 62) + 1, 1};
+        int64_t strides[] = {4, 4};
+        write_raw_tensor_file(path, CAUSA_DTYPE_F32, 2, shape, strides, 4);
+
+        causa_arena_t* arena = causa_arena_new(1024 * 1024);
+        causa_reader_t* r = causa_reader_open(path);
+        causa_tensor_t* t = r ? causa_read_tensor(r, arena, backend) : NULL;
+        if (t) {
+            test_fail("a file with an overflowing shape was accepted\n");
+            failed = true;
+        }
+        if (r) causa_reader_close(r);
+        causa_arena_free(arena);
+    }
+
+    // An ordinary tensor still loads, so the refusals are not simply the
+    // reader refusing everything.
+    {
+        int64_t shape[] = {4};
+        int64_t strides[] = {4};
+        write_raw_tensor_file(path, CAUSA_DTYPE_F32, 1, shape, strides, 16);
+
+        causa_arena_t* arena = causa_arena_new(1024 * 1024);
+        causa_reader_t* r = causa_reader_open(path);
+        causa_tensor_t* t = r ? causa_read_tensor(r, arena, backend) : NULL;
+        if (!t) {
+            test_fail("an ordinary file was refused\n");
+            failed = true;
+        }
+        if (r) causa_reader_close(r);
+        causa_arena_free(arena);
+    }
+
+    remove(path);
+    causa_backend_free(backend);
+    if (failed) return;
+    printf("PASS: serialization (a file with a bad geometry is refused)\n");
+}
+
+// The counts that decide how much memory is set aside have to be checked.
+void test_scm_and_memory_bounds() {
+    printf("Testing the bounds on counts...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // More interventions than the model has room for is refused. The count
+    // decides how much room the surgery needs on the stack.
+    {
+        causa_scm_t* scm = causa_scm_new(arena, backend, NULL);
+        if (!scm) {
+            test_fail("the model could not be made\n");
+            failed = true;
+        } else {
+            causa_tensor_t* targets[CAUSA_MAX_VARIABLES + 8];
+            causa_tensor_t* values[CAUSA_MAX_VARIABLES + 8];
+            for (int32_t i = 0; i < CAUSA_MAX_VARIABLES + 8; i++) {
+                int64_t shape[] = {1};
+                targets[i] = causa_tensor_new(arena, backend, shape, 1, NULL);
+                values[i] = causa_tensor_new(arena, backend, shape, 1, NULL);
+            }
+            if (causa_scm_do_multi(scm, targets, values, CAUSA_MAX_VARIABLES + 1)) {
+                test_fail("too many interventions were accepted\n");
+                failed = true;
+            }
+        }
+    }
+
+    // More noise terms than the model has room for is refused as well.
+    {
+        causa_scm_t* scm = causa_scm_new(arena, backend, NULL);
+        if (!scm) {
+            test_fail("the model could not be made\n");
+            failed = true;
+        } else {
+            int64_t shape[] = {1};
+            for (int32_t i = 0; i < CAUSA_MAX_VARIABLES + 4; i++) {
+                causa_tensor_t* n = causa_tensor_new(arena, backend, shape, 1, NULL);
+                if (causa_scm_add_exogenous(scm, n) != 0) break;
+            }
+            if (scm->num_exogenous > CAUSA_MAX_VARIABLES) {
+                test_fail("the model took %d noise terms, more than the %d it has room for\n",
+                          scm->num_exogenous, CAUSA_MAX_VARIABLES);
+                failed = true;
+            }
+        }
+    }
+
+    // Collecting into a matrix with too few rows is refused. A matrix with
+    // too few rows would be written past its end.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.key_dim = 3;
+        cfg.value_dim = 3;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (!mem) {
+            test_fail("the memory could not be made\n");
+            failed = true;
+        } else {
+            for (int i = 0; i < 5; i++) {
+                float key[3] = {(float)i, 0.0f, 0.0f};
+                float value[3] = {0.0f, 0.0f, 0.0f};
+                causa_tensor_t* k = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+                causa_tensor_t* v = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+                memcpy(k->data, key, sizeof(key));
+                memcpy(v->data, value, sizeof(value));
+                causa_memory_write(mem, k, v, CAUSA_MEMORY_EPISODIC);
+            }
+
+            int64_t too_small[] = {2, 3};
+            causa_tensor_t* out = causa_tensor_new(arena, backend, too_small, 2, NULL);
+            if (causa_memory_collect(mem, CAUSA_MEMORY_EPISODIC, out) >= 0) {
+                test_fail("a matrix with too few rows was accepted\n");
+                failed = true;
+            }
+
+            int64_t big_enough[] = {5, 3};
+            causa_tensor_t* good = causa_tensor_new(arena, backend, big_enough, 2, NULL);
+            if (causa_memory_collect(mem, CAUSA_MEMORY_EPISODIC, good) != 5) {
+                test_fail("the collection did not gather every observation\n");
+                failed = true;
+            }
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: the bounds on counts\n");
+}
+
+// An intervention on a model that was built as a graph has to be carried
+// out.
+//
+// The surgery that copies the model for an intervention looks for the
+// tensors the operations read, and the graph is only told about the
+// tensors an operation writes. The parents and the noise therefore have to
+// be registered with the graph as well, or the surgery fails and the
+// intervention is quietly dropped.
+void test_intervention_on_a_graph_model() {
+    printf("Testing an intervention on a model built as a graph...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    causa_scm_t* scm = causa_scm_new(arena, backend, NULL);
+    if (!scm) {
+        test_fail("the model could not be made\n");
+        causa_backend_free(backend);
+        causa_arena_free(arena);
+        return;
+    }
+
+    int64_t shape[] = {1};
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_F32;
+    opts.device = CAUSA_DEVICE_CPU;
+
+    causa_tensor_t* x0 = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* x1 = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* u1 = causa_tensor_new(arena, backend, shape, 1, &opts);
+    causa_tensor_t* value = causa_tensor_new(arena, backend, shape, 1, &opts);
+    if (!x0 || !x1 || !u1 || !value) {
+        test_fail("the tensors could not be made\n");
+        failed = true;
+    } else {
+        ((float*)x0->data)[0] = 1.0f;
+        ((float*)u1->data)[0] = 0.5f;
+        ((float*)value->data)[0] = 5.0f;
+
+        // x0 is an observation and u1 is the noise of x1.
+        causa_scm_add_observed_variable(scm, x0);
+        causa_scm_add_exogenous(scm, u1);
+
+        // x1 = x0 + u1, written as one operation over the parent and the
+        // noise.
+        causa_tensor_t* parents[] = {x0};
+        if (causa_scm_add_equation_op(scm, x1, parents, 1, u1, CAUSA_OP_ADD, NULL, 0) != 0) {
+            test_fail("the equation could not be added\n");
+            failed = true;
+        } else {
+            causa_scm_build(scm);
+
+            causa_intervention_t* iv = causa_intervention_new(arena, x0, value);
+            causa_scm_t* int_scm = iv ? causa_scm_do(scm, iv) : NULL;
+            if (!int_scm) {
+                test_fail("the intervention failed\n");
+                failed = true;
+            } else {
+                causa_tensor_t* outputs[1] = {x1};
+                causa_scm_evaluate(int_scm, outputs, 1);
+
+                // The values belong to the intervened model. The model
+                // that was intervened on keeps the values it had.
+                causa_tensor_t* got = int_scm->variables[1].variable;
+                float v = got ? ((const float*)got->data)[0] : 0.0f;
+                // 5.0 for the intervention, plus 0.5 for the noise.
+                if (fabsf(v - 5.5f) > 1e-4f) {
+                    test_fail("the intervention gave x1 = %g, expected 5.5\n", v);
+                    failed = true;
+                }
+
+                // The model that was intervened on is left as it was.
+                float before = ((const float*)x1->data)[0];
+                if (fabsf(before - 0.0f) > 1e-6f) {
+                    test_fail("the intervention changed the original model: x1 = %g, expected 0\n", before);
+                    failed = true;
+                }
+            }
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: an intervention on a model built as a graph\n");
+}
+
+// The gradients of the operations that work on more than one element.
+//
+// The backward of a matrix product used to give nothing back unless both
+// sides were plain matrices, so the gradient of a batched product was
+// dropped without a word. The backward of a reduction used to give the
+// gradient to every element of the reduced group, where it belongs only to
+// the largest one.
+//
+// The gradient buffers are laid out in order, whatever the layout of the
+// tensor they belong to, so a view of a larger tensor has to be handled by
+// the position and not by the strides.
+void test_backward_of_shapes() {
+    printf("Testing the gradients of batched and reduced operations...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // The gradient of a batched product is the product of the gradients.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+        opts.requires_grad = true;
+
+        int64_t shape[] = {2, 2, 2};
+        causa_tensor_t* a = causa_tensor_new(arena, backend, shape, 3, &opts);
+        causa_tensor_t* b = causa_tensor_new(arena, backend, shape, 3, &opts);
+        if (!a || !b) {
+            test_fail("the tensors could not be made\n");
+            failed = true;
+        } else {
+            float* ad = (float*)a->data;
+            float* bd = (float*)b->data;
+            for (int i = 0; i < 8; i++) { ad[i] = 1.0f; bd[i] = 1.0f; }
+
+            causa_tensor_t* c = causa_tensor_matmul(a, b);
+            if (!c) {
+                test_fail("the batched product failed\n");
+                failed = true;
+            } else {
+                causa_tensor_options_t sopts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+                sopts.dtype = CAUSA_DTYPE_F32;
+                sopts.device = CAUSA_DEVICE_CPU;
+                causa_tensor_t* seed = causa_tensor_new(arena, backend, shape, 3, &sopts);
+                causa_tensor_fill(seed, 1.0f);
+
+                causa_tensor_matmul_backward(a, b, seed);
+
+                if (!a->grad || !b->grad) {
+                    test_fail("the backward of a batched product gave no gradient\n");
+                    failed = true;
+                } else {
+                    // Every entry of the gradient is the sum of two ones.
+                    const float* ga = (const float*)a->grad->data;
+                    const float* gb = (const float*)b->grad->data;
+                    for (int i = 0; i < 8; i++) {
+                        if (fabsf(ga[i] - 2.0f) > 1e-5f || fabsf(gb[i] - 2.0f) > 1e-5f) {
+                            test_fail("the gradient of the batched product is %g and %g, expected 2 and 2\n",
+                                      ga[i], gb[i]);
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The gradient of the largest element belongs to that element alone.
+    {
+        causa_graph_t* graph = causa_graph_new(arena, backend);
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+        opts.requires_grad = true;
+
+        causa_tensor_t* x = causa_graph_new_tensor(graph, (int64_t[]){4}, 1, &opts);
+        float* xd = (float*)x->data;
+        xd[0] = 1.0f; xd[1] = 5.0f; xd[2] = 2.0f; xd[3] = 0.0f;
+
+        causa_reduce_ctx_t* rctx = (causa_reduce_ctx_t*)causa_arena_alloc(arena, sizeof(causa_reduce_ctx_t), 8);
+        rctx->reduce_op = CAUSA_REDUCE_MAX;
+        rctx->num_dims = 1;
+        rctx->dims[0] = 0;
+        rctx->keepdim = false;
+
+        causa_tensor_t* out = causa_graph_new_tensor(graph, (int64_t[]){1}, 1, &opts);
+        causa_graph_add_op(graph, CAUSA_OP_REDUCE, "max",
+            (causa_tensor_t*[]){x}, 1, (causa_tensor_t*[]){out}, 1,
+            NULL, NULL, rctx, sizeof(causa_reduce_ctx_t));
+
+        causa_graph_build(graph);
+        causa_graph_forward(graph);
+
+        // The gradient of the output is the seed of the backward pass. It
+        // is put in place of the output's own gradient buffer, the same way
+        // the abduction step does it.
+        causa_tensor_options_t sopts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        sopts.dtype = CAUSA_DTYPE_F32;
+        sopts.device = CAUSA_DEVICE_CPU;
+        causa_tensor_t* seed = causa_tensor_new(arena, backend, (int64_t[]){1}, 1, &sopts);
+        causa_tensor_fill(seed, 1.0f);
+        out->grad = seed;
+
+        causa_graph_backward(graph, NULL, 0);
+
+        const float* gx = x->grad ? (const float*)x->grad->data : NULL;
+        if (!gx) {
+            test_fail("the reduction gave no gradient\n");
+            failed = true;
+        } else {
+            float sum = gx[0] + gx[1] + gx[2] + gx[3];
+            if (fabsf(gx[1] - 1.0f) > 1e-5f || fabsf(sum - 1.0f) > 1e-5f) {
+                test_fail("the gradient of the largest is [%g %g %g %g], expected it on the second one alone\n",
+                          gx[0], gx[1], gx[2], gx[3]);
+                failed = true;
+            }
+        }
+    }
+
+    // The gradient of a view has to land in the view and nowhere else. A
+    // column of a matrix has strides that reach past its own elements, so
+    // a kernel that used them would write past the end of the gradient.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        int64_t shape[] = {2, 3};
+        causa_tensor_t* t = causa_tensor_new(arena, backend, shape, 2, &opts);
+        float* td = (float*)t->data;
+        for (int i = 0; i < 6; i++) td[i] = (float)(i + 1);
+
+        causa_tensor_t* column = causa_tensor_slice(t, (int64_t[]){0, 1}, (int64_t[]){2, 2}, NULL, 2);
+        if (!column) {
+            test_fail("the column could not be taken\n");
+            failed = true;
+        } else {
+            column->requires_grad = true;
+
+            causa_tensor_options_t o2 = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+            o2.dtype = CAUSA_DTYPE_F32;
+            o2.device = CAUSA_DEVICE_CPU;
+            causa_tensor_t* b = causa_tensor_new(arena, backend, (int64_t[]){2, 1}, 2, &o2);
+            causa_tensor_fill(b, 1.0f);
+            causa_tensor_t* seed = causa_tensor_new(arena, backend, (int64_t[]){2, 1}, 2, &o2);
+            causa_tensor_fill(seed, 1.0f);
+
+            causa_tensor_mul_backward(column, b, seed);
+
+            if (!column->grad) {
+                test_fail("the view gave no gradient\n");
+                failed = true;
+            } else {
+                const float* gc = (const float*)column->grad->data;
+                if (fabsf(gc[0] - 1.0f) > 1e-5f || fabsf(gc[1] - 1.0f) > 1e-5f) {
+                    test_fail("the gradient of the view is [%g %g], expected [1 1]\n", gc[0], gc[1]);
+                    failed = true;
+                }
+            }
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: the gradients of batched and reduced operations\n");
+}
+
+// The guards against a shape that does not fit.
+//
+// Every one of these used to read past the end of something: a key that is
+// narrower than the memory expects, a batch whose two halves do not have
+// the same width, and data that is not a matrix of samples and variables.
+void test_guards_against_bad_shapes() {
+    printf("Testing the guards against a shape that does not fit...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // A key that is narrower than the memory expects is not a key.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.key_dim = 4;
+        cfg.value_dim = 4;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (!mem) {
+            test_fail("the memory could not be made\n");
+            failed = true;
+        } else {
+            causa_tensor_t* key = causa_tensor_new(arena, backend, (int64_t[]){4}, 1, NULL);
+            causa_tensor_t* value = causa_tensor_new(arena, backend, (int64_t[]){4}, 1, NULL);
+            float* kd = (float*)key->data;
+            for (int i = 0; i < 3; i++) kd[i] = (float)(i + 1);
+            // The last element is a not-a-number. A comparison against one
+            // is never greater than anything, so a key that is read one
+            // element too far would match this one on every element.
+            kd[3] = NAN;
+            causa_tensor_fill(value, 1.0f);
+            causa_memory_write(mem, key, value, CAUSA_MEMORY_EPISODIC);
+
+            // A key that is one element short. Reading it as a key of four
+            // would read past its end.
+            causa_tensor_t* narrow = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+            float* nd = (float*)narrow->data;
+            nd[0] = 1.0f; nd[1] = 2.0f; nd[2] = 3.0f;
+
+            if (causa_memory_read(mem, narrow, CAUSA_MEMORY_EPISODIC)) {
+                test_fail("a key of the wrong width was accepted\n");
+                failed = true;
+            }
+        }
+    }
+
+    // A batch whose two halves are not the same width is not applied. The
+    // rule would read past the narrower half.
+    {
+        causa_plasticity_config_t pcfg = CAUSA_PLASTICITY_CONFIG_DEFAULTS;
+        pcfg.type = CAUSA_PLASTICITY_HEBBIAN;
+        causa_plasticity_rule_t* rule = causa_plasticity_rule_new(arena, &pcfg);
+        if (!rule) {
+            test_fail("the rule could not be made\n");
+            failed = true;
+        } else {
+            causa_tensor_t* pre = causa_tensor_new(arena, backend, (int64_t[]){2, 3}, 2, NULL);
+            causa_tensor_t* post = causa_tensor_new(arena, backend, (int64_t[]){2, 1}, 2, NULL);
+            causa_tensor_t* weight = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+            causa_tensor_fill(pre, 1.0f);
+            causa_tensor_fill(post, 1.0f);
+            causa_tensor_fill(weight, 0.0f);
+
+            causa_plasticity_apply_batch(rule, pre, post, weight);
+
+            const float* wd = (const float*)weight->data;
+            if (fabsf(wd[0]) > 1e-6f || fabsf(wd[1]) > 1e-6f || fabsf(wd[2]) > 1e-6f) {
+                test_fail("a batch of the wrong width was applied: [%g %g %g]\n", wd[0], wd[1], wd[2]);
+                failed = true;
+            }
+        }
+    }
+
+    // Data that is not a matrix of samples and variables is refused. A
+    // tensor with no dimensions has no last dimension to read.
+    {
+        causa_tensor_t* flat = causa_tensor_new(arena, backend, (int64_t[]){1}, 0, NULL);
+        if (!flat) {
+            test_fail("the tensor could not be made\n");
+            failed = true;
+        } else if (causa_discover(flat, NULL, NULL, NULL)) {
+            test_fail("data that is not a matrix was accepted\n");
+            failed = true;
+        }
+    }
+
+    // Asking for the parents of a variable without somewhere to put them
+    // is refused.
+    {
+        causa_discovery_t* disc = causa_discovery_new(arena, 3);
+        if (!disc) {
+            test_fail("the discovery could not be made\n");
+            failed = true;
+        } else if (causa_get_parents(disc, 0, NULL, 4) != -1) {
+            test_fail("a request for parents with nowhere to put them was accepted\n");
+            failed = true;
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: the guards against a shape that does not fit\n");
+}
+
+// The operations that used to say nothing when they should have said
+// something.
+//
+// A copy between tensors of different sizes did nothing at all, the memory
+// took a key of any width and stored it as one of its own, a plasticity
+// rule changed the key the memory is looked up by, four of the ways of
+// filling a tensor filled it with zeros, and two of the operations on
+// tensors gave nothing back at all.
+void test_the_operations_that_were_silent() {
+    printf("Testing the operations that used to say nothing...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // A copy between tensors of different sizes copies the part that both
+    // of them have.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        causa_tensor_t* src = causa_tensor_new(arena, backend, (int64_t[]){4}, 1, &opts);
+        causa_tensor_t* dst = causa_tensor_new(arena, backend, (int64_t[]){2}, 1, &opts);
+        float* sd = (float*)src->data;
+        for (int i = 0; i < 4; i++) sd[i] = (float)(i + 1);
+
+        causa_tensor_copy(dst, src);
+
+        const float* dd = (const float*)dst->data;
+        if (fabsf(dd[0] - 1.0f) > 1e-6f || fabsf(dd[1] - 2.0f) > 1e-6f) {
+            test_fail("the copy gave [%g %g], expected [1 2]\n", dd[0], dd[1]);
+            failed = true;
+        }
+    }
+
+    // A copy into a tensor that is not laid out in order puts the values in
+    // the right places.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        causa_tensor_t* src = causa_tensor_new(arena, backend, (int64_t[]){2, 1}, 2, &opts);
+        causa_tensor_t* dst = causa_tensor_new(arena, backend, (int64_t[]){2, 2}, 2, &opts);
+        float* sd = (float*)src->data;
+        sd[0] = 7.0f; sd[1] = 8.0f;
+
+        // A column of the destination, which is not laid out in order.
+        causa_tensor_t* column = causa_tensor_slice(dst, (int64_t[]){0, 0}, (int64_t[]){2, 1}, NULL, 2);
+        if (!column) {
+            test_fail("the column could not be taken\n");
+            failed = true;
+        } else {
+            causa_tensor_copy(column, src);
+            const float* dd = (const float*)dst->data;
+            if (fabsf(dd[0] - 7.0f) > 1e-6f || fabsf(dd[2] - 8.0f) > 1e-6f ||
+                fabsf(dd[1]) > 1e-6f || fabsf(dd[3]) > 1e-6f) {
+                test_fail("the copy into the column gave [%g %g %g %g], expected [7 0 8 0]\n",
+                          dd[0], dd[1], dd[2], dd[3]);
+                failed = true;
+            }
+        }
+    }
+
+    // The ways of filling a tensor that were declared but not done.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        // The identity.
+        causa_tensor_t* eye = causa_tensor_new(arena, backend, (int64_t[]){3, 3}, 2, &opts);
+        causa_tensor_init(eye, CAUSA_INIT_EYE, 0.0, 0.0);
+        const float* ed = (const float*)eye->data;
+        bool right = fabsf(ed[0] - 1.0f) < 1e-6f && fabsf(ed[4] - 1.0f) < 1e-6f &&
+                     fabsf(ed[8] - 1.0f) < 1e-6f && fabsf(ed[1]) < 1e-6f &&
+                     fabsf(ed[2]) < 1e-6f && fabsf(ed[3]) < 1e-6f &&
+                     fabsf(ed[5]) < 1e-6f && fabsf(ed[6]) < 1e-6f && fabsf(ed[7]) < 1e-6f;
+        if (!right) {
+            test_fail("the identity was not made\n");
+            failed = true;
+        }
+
+        // A matrix whose rows are at right angles to each other.
+        causa_tensor_t* orth = causa_tensor_new(arena, backend, (int64_t[]){3, 3}, 2, &opts);
+        causa_tensor_init(orth, CAUSA_INIT_ORTHOGONAL, 0.0, 0.0);
+        const float* od = (const float*)orth->data;
+        float worst = 0.0f;
+        for (int r = 0; r < 3; r++) {
+            for (int s = 0; s < 3; s++) {
+                float dot = 0.0f;
+                for (int c = 0; c < 3; c++) dot += od[r * 3 + c] * od[s * 3 + c];
+                float want = (r == s) ? 1.0f : 0.0f;
+                float off = fabsf(dot - want);
+                if (off > worst) worst = off;
+            }
+        }
+        if (worst > 1e-4f) {
+            test_fail("the rows of the orthogonal matrix are not at right angles (off by %g)\n", worst);
+            failed = true;
+        }
+
+        // The two ways of filling a matrix with numbers that come from the
+        // shape of the matrix.
+        causa_tensor_t* xavier = causa_tensor_new(arena, backend, (int64_t[]){4, 4}, 2, &opts);
+        causa_tensor_init(xavier, CAUSA_INIT_XAVIER_NORMAL, 1.0, 0.0);
+        const float* xd = (const float*)xavier->data;
+        bool all_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (xd[i] != 0.0f) all_zero = false;
+        }
+        if (all_zero) {
+            test_fail("the Xavier fill gave nothing but zeros\n");
+            failed = true;
+        }
+
+        causa_tensor_t* kaiming = causa_tensor_new(arena, backend, (int64_t[]){4, 4}, 2, &opts);
+        causa_tensor_init(kaiming, CAUSA_INIT_KAIMING_NORMAL, 1.0, 0.0);
+        const float* kd = (const float*)kaiming->data;
+        all_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (kd[i] != 0.0f) all_zero = false;
+        }
+        if (all_zero) {
+            test_fail("the Kaiming fill gave nothing but zeros\n");
+            failed = true;
+        }
+    }
+
+    // The comparison of two tensors.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        causa_tensor_t* a = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, &opts);
+        causa_tensor_t* b = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, &opts);
+        float* ad = (float*)a->data;
+        float* bd = (float*)b->data;
+        ad[0] = 1.0f; ad[1] = 2.0f; ad[2] = 3.0f;
+        bd[0] = 1.0f; bd[1] = 5.0f; bd[2] = 3.0f;
+
+        causa_tensor_t* same = causa_tensor_compare(a, b, CAUSA_CMP_EQ);
+        if (!same) {
+            test_fail("the comparison gave nothing back\n");
+            failed = true;
+        } else {
+            // The result of a comparison is a byte per element, so it is
+            // read through the loader and not as floats.
+            float s0 = causa_tensor_load_f32(same, 0);
+            float s1 = causa_tensor_load_f32(same, 1);
+            float s2 = causa_tensor_load_f32(same, 2);
+            if (s0 != 1.0f || s1 != 0.0f || s2 != 1.0f) {
+                test_fail("the comparison gave [%g %g %g], expected [1 0 1]\n", s0, s1, s2);
+                failed = true;
+            }
+        }
+
+        causa_tensor_t* bigger = causa_tensor_compare(a, b, CAUSA_CMP_LT);
+        if (!bigger) {
+            test_fail("the comparison gave nothing back\n");
+            failed = true;
+        } else {
+            float s0 = causa_tensor_load_f32(bigger, 0);
+            float s1 = causa_tensor_load_f32(bigger, 1);
+            float s2 = causa_tensor_load_f32(bigger, 2);
+            if (s0 != 0.0f || s1 != 1.0f || s2 != 0.0f) {
+                test_fail("the comparison gave [%g %g %g], expected [0 1 0]\n", s0, s1, s2);
+                failed = true;
+            }
+        }
+    }
+
+    // The change of element type.
+    {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        causa_tensor_t* a = causa_tensor_new(arena, backend, (int64_t[]){2}, 1, &opts);
+        float* ad = (float*)a->data;
+        ad[0] = 1.5f; ad[1] = 2.5f;
+
+        causa_tensor_t* wide = causa_tensor_to_dtype(a, CAUSA_DTYPE_F64);
+        if (!wide) {
+            test_fail("the change of type gave nothing back\n");
+            failed = true;
+        } else {
+            const double* wd = (const double*)wide->data;
+            if (fabs(wd[0] - 1.5) > 1e-9 || fabs(wd[1] - 2.5) > 1e-9) {
+                test_fail("the change of type gave [%g %g], expected [1.5 2.5]\n", wd[0], wd[1]);
+                failed = true;
+            }
+        }
+    }
+
+    // The memory refuses a key or a value that is not the right width, and
+    // a plasticity rule does not change the key the memory is looked up by.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.key_dim = 3;
+        cfg.value_dim = 3;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (!mem) {
+            test_fail("the memory could not be made\n");
+            failed = true;
+        } else {
+            causa_tensor_t* narrow = causa_tensor_new(arena, backend, (int64_t[]){2}, 1, NULL);
+            causa_tensor_t* value = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+            causa_tensor_fill(narrow, 1.0f);
+            causa_tensor_fill(value, 1.0f);
+
+            if (causa_memory_write(mem, narrow, value, CAUSA_MEMORY_EPISODIC)) {
+                test_fail("a key of the wrong width was stored\n");
+                failed = true;
+            }
+
+            // A rule that would change the key if it were applied to it.
+            causa_plasticity_config_t pcfg = CAUSA_PLASTICITY_CONFIG_DEFAULTS;
+            pcfg.type = CAUSA_PLASTICITY_HEBBIAN;
+            pcfg.learning_rate = 1.0f;
+            causa_plasticity_rule_t* rule = causa_plasticity_rule_new(arena, &pcfg);
+            causa_memory_set_plasticity(mem, CAUSA_MEMORY_EPISODIC, rule);
+
+            causa_tensor_t* key = causa_tensor_new(arena, backend, (int64_t[]){3}, 1, NULL);
+            float* kd = (float*)key->data;
+            kd[0] = 1.0f; kd[1] = 2.0f; kd[2] = 3.0f;
+
+            causa_memory_write(mem, key, value, CAUSA_MEMORY_EPISODIC);
+            causa_memory_write(mem, key, value, CAUSA_MEMORY_EPISODIC);
+
+            // The same key twice is one entry, not two. A rule that changed
+            // the key would make the second write miss.
+            if (causa_memory_occupied(mem, CAUSA_MEMORY_EPISODIC) != 1) {
+                test_fail("the memory holds %d entries, expected one\n",
+                          causa_memory_occupied(mem, CAUSA_MEMORY_EPISODIC));
+                failed = true;
+            }
+        }
+    }
+
+    // The laws of a child are counted, however many there are.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.key_dim = 8;
+        cfg.value_dim = 8;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (!mem) {
+            test_fail("the memory could not be made\n");
+            failed = true;
+        } else {
+            // Seventy laws of the same child, each with a different set of
+            // parents. A count that stopped at the size of a list would say
+            // that there were only sixty-four of them.
+            const int32_t child = 7;
+            const int32_t wanted = 70;
+
+            for (int32_t n = 0; n < wanted; n++) {
+                causa_tensor_t* mask = causa_tensor_new(arena, backend, (int64_t[]){8}, 1, NULL);
+                causa_tensor_t* coeff = causa_tensor_new(arena, backend, (int64_t[]){8}, 1, NULL);
+                float* md = (float*)mask->data;
+                float* cd = (float*)coeff->data;
+                for (int32_t bit = 0; bit < 7; bit++) {
+                    bool on = (n & (1 << bit)) != 0;
+                    md[bit] = on ? 1.0f : 0.0f;
+                    cd[bit] = on ? (float)(bit + 1) : 0.0f;
+                }
+                md[child] = 0.0f;
+                cd[child] = 0.0f;
+                causa_memory_store_causal_law(mem, child, mask, coeff);
+            }
+
+            int32_t count = causa_memory_count_causal_laws(mem, child);
+            if (count != wanted) {
+                test_fail("the child was found to have %d laws, expected %d\n", count, wanted);
+                failed = true;
+            }
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: the operations that used to say nothing\n");
+}
+
+// The lifetime of an intervened model.
+//
+// An intervention makes a copy of the model. The copy has to be its own in
+// every way: the values it computes must not land in the model it came
+// from, and a second intervention on it must keep the first.
+//
+// A memory whose capacity is more than it can hold is refused rather than
+// asked for.
+void test_the_lifetime_of_an_intervened_model() {
+    printf("Testing the lifetime of an intervened model...\n"); fflush(stdout);
+
+    causa_arena_t* arena = causa_arena_new(4 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    bool failed = false;
+
+    // x0 is an observation and x1 = x0 + u1.
+    causa_scm_t* scm = causa_scm_new(arena, backend, NULL);
+    if (!scm) {
+        test_fail("the model could not be made\n");
+        failed = true;
+    } else {
+        causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        opts.dtype = CAUSA_DTYPE_F32;
+        opts.device = CAUSA_DEVICE_CPU;
+
+        int64_t shape[] = {1};
+        causa_tensor_t* x0 = causa_tensor_new(arena, backend, shape, 1, &opts);
+        causa_tensor_t* x1 = causa_tensor_new(arena, backend, shape, 1, &opts);
+        causa_tensor_t* u1 = causa_tensor_new(arena, backend, shape, 1, &opts);
+        causa_tensor_t* value = causa_tensor_new(arena, backend, shape, 1, &opts);
+        if (!x0 || !x1 || !u1 || !value) {
+            test_fail("the tensors could not be made\n");
+            failed = true;
+        } else {
+            ((float*)x0->data)[0] = 1.0f;
+            ((float*)u1->data)[0] = 0.5f;
+            ((float*)value->data)[0] = 5.0f;
+
+            causa_scm_add_observed_variable(scm, x0);
+            causa_scm_add_exogenous(scm, u1);
+
+            causa_tensor_t* parents[] = {x0};
+            if (causa_scm_add_equation_op(scm, x1, parents, 1, u1, CAUSA_OP_ADD, NULL, 0) != 0) {
+                test_fail("the equation could not be added\n");
+                failed = true;
+            } else {
+                causa_scm_build(scm);
+
+                causa_intervention_t* iv = causa_intervention_new(arena, x0, value);
+                causa_scm_t* first = iv ? causa_scm_do(scm, iv) : NULL;
+                if (!first) {
+                    test_fail("the intervention failed\n");
+                    failed = true;
+                } else {
+                    causa_scm_evaluate(first, NULL, 0);
+
+                    float x1_after = ((const float*)first->variables[1].variable->data)[0];
+                    if (fabsf(x1_after - 5.5f) > 1e-4f) {
+                        test_fail("the intervention gave x1 = %g, expected 5.5\n", x1_after);
+                        failed = true;
+                    }
+
+                    // A second intervention on the first one. The first
+                    // intervention has to survive it.
+                    causa_tensor_t* second_value = causa_tensor_new(arena, backend, shape, 1, &opts);
+                    ((float*)second_value->data)[0] = 2.0f;
+                    causa_intervention_t* iv2 = causa_intervention_new(arena, x1, second_value);
+                    causa_scm_t* second = iv2 ? causa_scm_do(first, iv2) : NULL;
+                    if (!second) {
+                        test_fail("the second intervention failed\n");
+                        failed = true;
+                    } else {
+                        causa_scm_evaluate(second, NULL, 0);
+
+                        float x0_after = ((const float*)second->variables[0].variable->data)[0];
+                        float x1_after2 = ((const float*)second->variables[1].variable->data)[0];
+                        if (fabsf(x0_after - 5.0f) > 1e-4f) {
+                            test_fail("the second intervention lost the first: x0 = %g, expected 5\n", x0_after);
+                            failed = true;
+                        }
+                        if (fabsf(x1_after2 - 2.0f) > 1e-4f) {
+                            test_fail("the second intervention gave x1 = %g, expected 2\n", x1_after2);
+                            failed = true;
+                        }
+
+                        // The model the interventions started from keeps the
+                        // values it had.
+                        float x0_original = ((const float*)x0->data)[0];
+                        float x1_original = ((const float*)x1->data)[0];
+                        if (fabsf(x0_original - 1.0f) > 1e-6f || fabsf(x1_original - 0.0f) > 1e-6f) {
+                            test_fail("the interventions changed the original model: x0 = %g, x1 = %g\n",
+                                      x0_original, x1_original);
+                            failed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A capacity that is more than the memory can hold is refused.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.capacity[CAUSA_MEMORY_SEMANTIC] = (int64_t)1 << 40;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (mem) {
+            test_fail("a capacity of a billion slots was accepted\n");
+            failed = true;
+        }
+    }
+
+    // A capacity that is not a count of slots at all is refused.
+    {
+        causa_memory_config_t cfg = CAUSA_MEMORY_CONFIG_DEFAULTS;
+        cfg.capacity[CAUSA_MEMORY_WORKING] = -5;
+        causa_memory_t* mem = causa_memory_new(arena, backend, &cfg);
+        if (mem) {
+            test_fail("a negative capacity was accepted\n");
+            failed = true;
+        }
+    }
+
+    causa_backend_free(backend);
+    causa_arena_free(arena);
+    if (failed) return;
+    printf("PASS: the lifetime of an intervened model\n");
+}
+
 int main() {
     printf("=== Tensor Library Tests ===\n\n");
     fflush(stdout);
@@ -2716,6 +4025,11 @@ int main() {
     fflush(stdout);
     test_intervention_planning();
     fflush(stdout);
+    test_intervention_planning_several_goals();
+    fflush(stdout);
+    test_counterfactuals_in_memory();
+    fflush(stdout);
+    fflush(stdout);
     test_serialization_tensor();
     fflush(stdout);
     test_serialization_refuses_bad_files();
@@ -2723,6 +4037,22 @@ int main() {
     test_serialization_memory();
     fflush(stdout);
     test_serialization_scm();
+    fflush(stdout);
+    test_dtype_kernels();
+    fflush(stdout);
+    test_serialization_refuses_bad_geometry();
+    fflush(stdout);
+    test_scm_and_memory_bounds();
+    fflush(stdout);
+    test_intervention_on_a_graph_model();
+    fflush(stdout);
+    test_backward_of_shapes();
+    fflush(stdout);
+    test_guards_against_bad_shapes();
+    fflush(stdout);
+    test_the_operations_that_were_silent();
+    fflush(stdout);
+    test_the_lifetime_of_an_intervened_model();
     fflush(stdout);
 
     printf("\n=== All tests completed ===\n");

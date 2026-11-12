@@ -13,6 +13,11 @@ extern "C" {
 
 #define CAUSA_MEMORY_MAX_LEVELS 4
 
+// The largest number of slots a level may hold. A level has one slot
+// struct for each of its slots, so the number decides how much memory is
+// set aside before anything is stored. A capacity above this is refused.
+#define CAUSA_MEMORY_MAX_SLOTS 1048576
+
 typedef enum {
     CAUSA_MEMORY_WORKING = 0,    // Fast, small, volatile
     CAUSA_MEMORY_EPISODIC = 1,   // Medium, event-based
@@ -29,6 +34,20 @@ typedef enum {
 typedef struct causa_memory_s causa_memory_t;
 typedef struct causa_memory_slot_s causa_memory_slot_t;
 typedef struct causa_memory_config_s causa_memory_config_t;
+
+// A counterfactual kept in memory: what would have happened, in what
+// situation, and to which variable.
+//
+// The counterfactuals are kept apart from the episodes, because an episode
+// is something that happened and a counterfactual is something that would
+// have happened. Were they mixed, the discovery would learn from things
+// that never occurred.
+typedef struct {
+    char query_name[CAUSA_MAX_NAME];
+    causa_tensor_t* context;
+    causa_tensor_t* result;
+    float timestamp;
+} causa_memory_counterfactual_t;
 
 typedef void (*causa_memory_write_fn)(causa_memory_t* mem, causa_tensor_t* key, causa_tensor_t* value, causa_memory_level_t level);
 typedef causa_tensor_t* (*causa_memory_read_fn)(causa_memory_t* mem, causa_tensor_t* key, causa_memory_level_t level);
@@ -62,6 +81,15 @@ causa_memory_t* causa_memory_new(
 
 void causa_memory_free(causa_memory_t* mem);
 
+// Write a key and a value into a level of memory.
+//
+// The key has to be as wide as the memory's keys are and the value as wide
+// as its values are. A key or a value of another width is refused, because
+// the slot it would go into is of a fixed width and the rest of it would
+// hold whatever was there before.
+//
+// The value that was written is given back. It is the memory's own tensor,
+// so it must not be changed by the caller.
 causa_tensor_t* causa_memory_write(
     causa_memory_t* mem,
     causa_tensor_t* key,
@@ -69,12 +97,26 @@ causa_tensor_t* causa_memory_write(
     causa_memory_level_t level
 );
 
+// The tensors a memory hands back are the memory's own.
+//
+// They are given back so that the caller does not have to copy them, and
+// they must not be changed: a caller that writes to one changes what the
+// memory holds. They stay valid as long as the memory does, and they are
+// gone when it is freed.
+//
+// The tensors that a memory was given are copied into it, so the caller
+// keeps its own and can change them afterwards.
 causa_tensor_t* causa_memory_read(
     causa_memory_t* mem,
     causa_tensor_t* key,
     causa_memory_level_t level
 );
 
+// The k keys and values that are most like the given one, the nearest
+// first.
+//
+// The tensors written to the out arrays are the memory's own, and must not
+// be changed.
 causa_tensor_t* causa_memory_read_topk(
     causa_memory_t* mem,
     causa_tensor_t* key,
@@ -110,8 +152,17 @@ typedef struct {
     causa_memory_level_t level;
 } causa_memory_slot_info_t;
 
+// The key and the value of a slot.
+//
+// They are the memory's own tensors, and must not be changed.
 causa_memory_slot_info_t causa_memory_inspect(const causa_memory_t* mem, causa_memory_level_t level, int64_t index);
 
+// The plasticity rules.
+//
+// The spike timing rule and the neurogenesis rule are declared but are not
+// implemented: the first needs the time a spike happened and the second
+// needs room to be made, and neither fits the model as it is. A rule of
+// either kind does nothing.
 typedef enum {
     CAUSA_PLASTICITY_HEBBIAN = 0,
     CAUSA_PLASTICITY_OJA = 1,
@@ -243,6 +294,10 @@ int64_t causa_memory_collect(
 // describes, 1 marks each of its parents, and 0 marks the rest. The value
 // holds the coefficient of each variable in the child's equation.
 //
+// The value has to be as wide as the key, because the coefficient of a
+// parent is read from it. A memory whose values are narrower cannot hold
+// the law, and the call gives nothing back.
+//
 // Storing a law returns the slot that holds it.
 causa_tensor_t* causa_memory_store_causal_law(
     causa_memory_t* mem,
@@ -284,6 +339,50 @@ int32_t causa_memory_count_causal_laws(
     int32_t child
 );
 
+// ===== Counterfactuals in memory =====
+
+// Store a counterfactual: what would have happened, in a given situation.
+//
+// A counterfactual is what would have happened to a variable if something
+// else had been done. It is kept apart from the episodes, because an
+// episode is something that happened and a counterfactual is something
+// that would have happened. Were they mixed, the discovery would learn
+// from things that never occurred.
+//
+// The query_name says which variable the question was about, so that only
+// the counterfactuals about that variable are returned later. The context
+// is the situation the question was asked in, and the result is what would
+// have happened.
+//
+// The counterfactuals are kept in the order they were added, up to the
+// capacity of the episodic level, and the oldest are dropped first.
+//
+// Returns the number of counterfactuals kept, or -1 on error.
+int32_t causa_memory_keep_counterfactual(
+    causa_memory_t* mem,
+    const char* query_name,
+    const causa_tensor_t* context,
+    const causa_tensor_t* result
+);
+
+// The counterfactuals about one variable, in the situations most like the
+// given one.
+//
+// The distance between two situations is the straight-line distance
+// between them, so it is in the units of the situation.
+//
+// Writes the results to out_results and returns how many were found, or
+// -1 on error.
+//
+// The results are the memory's own tensors, and must not be changed.
+int32_t causa_memory_find_counterfactuals(
+    const causa_memory_t* mem,
+    const char* query_name,
+    const causa_tensor_t* context,
+    int32_t max_results,
+    causa_tensor_t** out_results
+);
+
 // ===== Reasoning over memory =====
 
 // Predict the variables that were not observed.
@@ -302,7 +401,10 @@ int32_t causa_memory_count_causal_laws(
 // The prediction is written to out, which needs room for one value per
 // variable. Observed variables are copied through unchanged.
 //
-// Returns the number of variables that were predicted, or -1 on error.
+// Returns the number of variables that were predicted, or -1 on error. A
+// variable whose value could not be worked out, because the laws are in a
+// cycle, is reported as an error rather than as a value that is not a
+// number.
 int32_t causa_memory_predict(
     causa_memory_t* mem,
     const causa_tensor_t* observation,
@@ -352,6 +454,9 @@ causa_tensor_t* causa_memory_store_procedure(
 //
 // Writes the triggers and the actions to the out arrays and returns how
 // many were found, or -1 on error.
+//
+// The tensors written to the out arrays are the memory's own, and must not
+// be changed.
 int32_t causa_memory_find_procedures(
     const causa_memory_t* mem,
     const causa_tensor_t* state,
@@ -381,13 +486,17 @@ int32_t causa_memory_learn_procedures(
 // Work out what to do to reach a goal.
 //
 // The state says where things stand and the goal says what is wanted. The
-// goal holds the wanted value of the variable to be changed, and NaN for
+// goal holds the wanted value of each variable to be changed, and NaN for
 // the rest, in the same way the observation marks what was not observed.
 //
 // The laws say which variables cause the goal and how much, so the
 // intervention that reaches the goal follows from them. The strongest cause
 // is the one that is acted on, because it moves the goal the most for the
 // least change.
+//
+// Several goals can be wanted at once. They are solved together, so that a
+// change made for one goal does not undo another. Where the goals cannot
+// all be reached, the change that fits them best is given.
 //
 // The intervention is written to out as a change to each variable. A
 // variable that does not need to change is left at zero.

@@ -162,6 +162,21 @@ typedef enum {
     CAUSA_INIT_EYE = 9
 } causa_init_t;
 
+// Fill a tensor according to one of the initialisations.
+//
+// The parameters mean different things for different initialisations:
+//
+//   ZEROS, ONES, ORTHOGONAL and EYE take none.
+//
+//   UNIFORM takes the low and the high value.
+//
+//   NORMAL takes the mean and the standard deviation.
+//
+//   XAVIER_UNIFORM, XAVIER_NORMAL, KAIMING_UNIFORM and KAIMING_NORMAL take
+//   the gain the scale is multiplied by and the mean. The scale itself
+//   comes from the shape of the tensor: Xavier from the number of values
+//   that come in and the number that go out, and Kaiming from the number
+//   that come in.
 void causa_tensor_init(causa_tensor_t* tensor, causa_init_t init, double param1, double param2);
 
 typedef enum {
@@ -202,6 +217,11 @@ typedef enum {
     CAUSA_CMP_GE = 5
 } causa_cmp_op_t;
 
+// Compare two tensors element by element.
+//
+// The result has one byte per element: a byte that is not zero where the
+// comparison holds and a byte that is zero where it does not. The two
+// tensors have to have the same shape.
 causa_tensor_t* causa_tensor_compare(
     const causa_tensor_t* a,
     const causa_tensor_t* b,

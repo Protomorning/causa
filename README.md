@@ -249,7 +249,7 @@ print(cf.compute(scm).tolist())
 
 ## Tests
 
-30 C tests, 59 Python binding assertions and 38 causal binding assertions, all
+40 C tests, 66 Python binding assertions and 53 causal binding assertions, all
 passing.
 
 ## Not yet implemented
@@ -258,15 +258,29 @@ passing.
 - Metal and Vulkan backends are declared but not implemented.
 - The CUDA backend is built when the CUDA toolkit is present. The same
   source compiles either way: with `nvcc` it is the real backend, without it
-  the file gives a stub that reports that there is no CUDA. It has not been
-  run on a device here, so treat it as untested.
-- `causa_memory_retrieve_counterfactuals` matches on the context vector only;
-  it does not yet filter by the query variable.
+  the file gives a stub that reports that there is no CUDA. The Python build
+  compiles the file with the host compiler, so it always gets the stub.
+- The CUDA backend has not been run on a device, and it is not ready to be:
+  its tensors are allocated in the host arena and their addresses are passed
+  to the kernels as device pointers, the result of a CUDA call is not checked,
+  and nothing waits for a kernel to finish before the result is read. It
+  would give wrong answers rather than fail.
+- The counterfactual gradient is not implemented. `causa_counterfactual_gradient`
+  ignores the variable it is asked to differentiate with, and
+  `causa_counterfactual_grad_wrt_intervention` gives nothing back, because the
+  intervention value never reaches the graph the backward pass walks.
+- `causa_memory_to_graph` builds a graph whose read operations have no
+  forward function, so the graph computes nothing. It has no callers.
+- The file format is written in the byte order and the word size of the
+  machine that wrote it, and nothing in the file says which that was. A file
+  does not move between machines of a different byte order.
+- A counterfactual that is kept holds its result at the width of a key
+  rather than the width of a value. The two are the same by default.
+- The spike timing rule and the neurogenesis rule are declared but do
+  nothing: the first needs the time a spike happened and the second needs
+  room to be made, and neither fits the model as it is.
 - The laws are linear, so a relation that is not linear in the parents is
   only described by its average. The episodes cover that gap when a
   prediction is made.
 - The intervention plan acts on one variable, so a goal that needs several
   causes at once is only partly reached.
-- The Python bindings save and load tensors. Saving a model or a memory is
-  available in C (`causa_save_scm`, `causa_load_scm`, `causa_save_memory`,
-  `causa_load_memory`) but is not exposed to Python yet.

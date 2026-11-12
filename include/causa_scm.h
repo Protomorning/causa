@@ -4,6 +4,7 @@
 #include "causa_tensor.h"
 #include "causa_graph.h"
 #include "causa_memory.h"
+#include "causa_platform.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -11,9 +12,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#define CAUSA_MAX_VARIABLES 64
-#define CAUSA_MAX_PARENTS 16
 
 // Forward declarations
 typedef struct causa_scm_s causa_scm_t;
@@ -37,6 +35,7 @@ typedef struct {
 typedef struct {
     float discovery_alpha;      // Sparsity penalty for NOTEARS
     float discovery_threshold;  // Edge threshold
+    float discovery_lr;         // Learning rate of the NOTEARS optimisation
     int32_t max_iterations;     // Max optimization iterations
     bool use_interventional;    // Use interventional data if available
     float counterfactual_lr;    // Learning rate for counterfactual optimization
@@ -46,6 +45,7 @@ typedef struct {
 #define CAUSA_CONFIG_DEFAULTS { \
     .discovery_alpha = 0.1f, \
     .discovery_threshold = 0.3f, \
+    .discovery_lr = 0.01f, \
     .max_iterations = 200, \
     .use_interventional = true, \
     .counterfactual_lr = 0.01f, \
@@ -65,6 +65,24 @@ struct causa_scm_s {
     causa_tensor_t** intervened_map;
     int32_t num_intervened_map;
 
+    // The graph the intervened graph was made from. The map is indexed by
+    // the source graph's order, so the source is needed to read a value
+    // back.
+    causa_graph_t* intervened_source;
+
+    // The arena the intervened graph and the tensors it made were put in.
+    //
+    // The copy of the model is of its own, so that making one does not
+    // make the arena of the model it was made from any bigger. It is
+    // released with the model that was intervened on.
+    causa_arena_t* intervened_arena;
+
+    // The model this one was made from, when it was made by an
+    // intervention. A caller that intervenes on a model twice gives the
+    // target in terms of the model it started with, and this is how the
+    // target is found in the model that was intervened on.
+    causa_scm_t* parent;
+
     causa_scm_var_t variables[CAUSA_MAX_VARIABLES];
     int32_t num_variables;
 
@@ -76,6 +94,11 @@ struct causa_scm_s {
     // model and must not be copied into an intervened graph, because its
     // inputs are the observed values rather than model tensors.
     int32_t num_model_ops;
+
+    // The number of operations that the reconstruction loss added to the
+    // model's graph. A second abduction takes the earlier loss out before
+    // it puts a new one in, so the error is not counted twice.
+    int32_t loss_op_count;
 
     // Topological order for ancestral sampling
     int32_t topo_order[CAUSA_MAX_VARIABLES];
@@ -126,7 +149,9 @@ struct causa_counterfactual_s {
 
 // Causal discovery result
 struct causa_discovery_s {
-    // Adjacency matrix: discovered[i][j] = 1 if j -> i (j is parent of i)
+    // Adjacency matrix: adjacency[parent][child] = 1 if the parent is a
+    // cause of the child. The order matches the weights below, so that
+    // the two matrices are read the same way.
     int32_t adjacency[CAUSA_MAX_VARIABLES][CAUSA_MAX_VARIABLES];
     float confidence[CAUSA_MAX_VARIABLES][CAUSA_MAX_VARIABLES];
 
@@ -152,6 +177,10 @@ causa_scm_t* causa_scm_new(
     const causa_config_t* config
 );
 
+// Release the copy of the model that an intervention made.
+//
+// The model itself belongs to the caller and is not touched: its arena is
+// the caller's, and nothing here is taken from it.
 void causa_scm_free(causa_scm_t* scm);
 
 // Build SCM from computation graph (each node becomes structural equation)
@@ -183,7 +212,7 @@ int causa_scm_add_equation(
 // For the common linear case, use CAUSA_OP_MUL with a coefficient tensor in
 // ctx, followed by CAUSA_OP_ADD with the noise.
 //
-// Returns the number of equations added.
+// Returns 0 when the equation was added, or -1 when it was not.
 int causa_scm_add_equation_op(
     causa_scm_t* scm,
     causa_tensor_t* target,
@@ -279,6 +308,19 @@ causa_intervention_t* causa_intervention_new(
 );
 
 // Apply do(X=x) - returns new intervened SCM
+//
+// The model that is returned is a copy of the one given, with the
+// intervened variable taking its constant value. The two do not share
+// their variables: evaluating the copy does not change the model it was
+// made from.
+//
+// The copy holds a pointer to the model it was made from, so that a
+// second intervention on it can be given its target in terms of the model
+// the caller started with. The copy must therefore not be used after the
+// model it was made from has been freed.
+//
+// The copy is released with causa_scm_free. The model it was made from
+// belongs to the caller, and is not touched.
 causa_scm_t* causa_scm_do(
     causa_scm_t* scm,
     causa_intervention_t* intervention
@@ -342,6 +384,9 @@ int causa_counterfactual_prediction(
 
 // Counterfactual gradient: d Y_x(u) / d x
 // Enables gradient-based counterfactual optimization
+//
+// This is not implemented yet. The variable it is asked to differentiate
+// with is ignored, and nothing is given back.
 causa_tensor_t* causa_counterfactual_gradient(
     causa_scm_t* scm,
     causa_counterfactual_t* cf,
@@ -357,6 +402,9 @@ int causa_counterfactual_compute_with_grad(
 );
 
 // Gradient of counterfactual loss w.r.t. intervention value
+//
+// This is not implemented yet: the intervention value never reaches the
+// graph the backward pass walks, so nothing is given back.
 causa_tensor_t* causa_counterfactual_grad_wrt_intervention(
     causa_scm_t* scm,
     causa_counterfactual_t* cf
@@ -374,6 +422,11 @@ void causa_discovery_free(causa_discovery_t* discovery);
 // NOTEARS-based causal discovery from observational + interventional data
 // Minimizes: L(W) + alpha * ||W||_1 + rho/2 * h(W)^2
 // where h(W) = tr(exp(W⊙W)) - d (acyclicity constraint)
+//
+// The interventional data is read as one row per sample, and the target of
+// each row says which variable was intervened on in that sample. The
+// samples that share a target are averaged together, so that the effect of
+// an intervention is read from all of them.
 causa_discovery_t* causa_discover(
     causa_tensor_t* observational_data,   // [N, D] - observational samples
     causa_tensor_t* interventional_data,  // [M, D] - interventional samples (with do() markers)
@@ -382,6 +435,16 @@ causa_discovery_t* causa_discover(
 );
 
 // Apply discovered structure to SCM (prune edges below threshold)
+//
+// The edges the data does not support are taken out of the discovery and
+// out of the model. The variables of a model are registered in index
+// order, which is the order the discovery uses, so the parent of a
+// variable can be matched to the edge of the discovery.
+//
+// The equations of a model that was built as a graph are left as they
+// are: the pruned structure is what a model built from the laws would
+// have, and the graph would have to be rebuilt for the change to take
+// effect there.
 void causa_apply_discovery(
     causa_scm_t* scm,
     causa_discovery_t* discovery,
@@ -401,6 +464,8 @@ int32_t causa_get_parents(
 // Transport causal effect from source to target domain
 // Using selection diagrams (Pearl & Bareinboim)
 // Returns P_target(Y | do(X)) estimated from source + target observations
+//
+// This is not implemented yet. The call gives nothing back.
 causa_tensor_t* causa_transport(
     causa_scm_t* source_scm,
     causa_scm_t* target_scm,

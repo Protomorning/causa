@@ -23,6 +23,11 @@ extern "C" {
 // allocated, so a wrong one would be a way to ask for anything.
 #define CAUSA_IO_MAX_ITEMS 1048576u
 
+// The largest number of elements a tensor in a file may hold. The count of
+// elements decides how much memory is set aside, so it is checked before
+// the allocation rather than after it.
+#define CAUSA_IO_MAX_ELEMENTS ((int64_t)1 << 24)
+
 // Section tags in the file
 typedef enum {
     CAUSA_IO_SECTION_TENSORS = 1,

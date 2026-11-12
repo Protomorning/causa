@@ -90,8 +90,16 @@ void* causa_arena_alloc(causa_arena_t* arena, size_t size, size_t alignment) {
     uintptr_t aligned = (addr + alignment - 1) & ~(uintptr_t)(alignment - 1);
     size_t padding = aligned - addr;
 
-    if (block->offset + padding + size > block->capacity) {
-        causa_arena_block_t* new_block = arena_block_new(arena, padding + size);
+    // The room left in the block has to be worked out without overflowing.
+    // A size near the top of the range would wrap and look small enough to
+    // fit, and the allocation would then run past the end of the block.
+    if (size > SIZE_MAX - padding) return NULL;
+    if (padding + size > block->capacity - block->offset) {
+        // A new block is asked for room enough for the worst padding there
+        // could be. The address the data starts at is not known until the
+        // block has been made, and the padding depends on that address.
+        if (size > SIZE_MAX - alignment) return NULL;
+        causa_arena_block_t* new_block = arena_block_new(arena, size + alignment);
         if (!new_block) return NULL;
 
         new_block->next = block->next;

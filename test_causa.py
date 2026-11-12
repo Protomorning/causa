@@ -272,6 +272,113 @@ def test_input_is_checked():
         check("a model with too many variables is refused", True)
 
 
+def test_leaf_backward_gives_no_tensor():
+    """The backward pass on a leaf has nothing to give back.
+
+    A leaf has no gradient buffer until a backward pass makes one, so the
+    result of asking for it is a tensor with no data behind it. Using it as
+    the right-hand side of an operation used to read through that missing
+    pointer and stop the interpreter.
+    """
+    a = causa.zeros([2])
+    g = a.backward()
+    check("a leaf gives no gradient tensor", g is None or g.tolist() is None,
+          f"got {g}")
+
+    raised = False
+    try:
+        x = causa.zeros([2]) + g
+    except (ValueError, TypeError):
+        raised = True
+    check("a tensor with no data behind it is refused", raised,
+          "the operation went through")
+
+
+def test_other_element_types_are_read_correctly():
+    """A tensor of another element type has to be read and written as one.
+
+    The bindings used to read every buffer as floats. A tensor of one byte
+    per element was then read four bytes at a time, so it showed nonsense
+    and a write to one element ran into the next one.
+    """
+    import struct
+
+    def u32(v):
+        return struct.pack("<I", v)
+
+    def i64(v):
+        return struct.pack("<q", v)
+
+    def u64(v):
+        return struct.pack("<Q", v)
+
+    def u8(v):
+        return struct.pack("<B", v)
+
+    # A tensor of four bytes: the element type is one byte per element.
+    record = u32(7) + u32(0) + u32(1)      # dtype, device, layout
+    record += i64(1) + i64(4) + i64(1)     # ndim, shape, strides
+    record += i64(0) + u8(0)               # offset, requires_grad
+    record += u32(0)                       # the name
+    record += u64(4) + bytes([1, 2, 3, 4]) # the data
+    record += u8(0)                       # no gradient
+
+    blob = u32(0x52534E54) + u32(3) + u32(1) + u32(1) + record
+
+    path = os.path.join(tempfile.mkdtemp(prefix="causa_dtype_"), "int8.bin")
+    with open(path, "wb") as f:
+        f.write(blob)
+
+    t = causa.load(path)
+    check("a tensor of bytes holds the values it was given",
+          t.tolist() == [1.0, 2.0, 3.0, 4.0], f"got {t.tolist()}")
+
+    # A write to one element must not run into the next one.
+    t[0] = 9.0
+    check("a write to one element leaves the others alone",
+          t.tolist() == [9.0, 2.0, 3.0, 4.0], f"got {t.tolist()}")
+
+
+def test_transpose_gradient():
+    """The gradient of a transpose is the transpose of the gradient.
+
+    The transpose gives a view, and a view is not laid out in order, so a
+    gradient that was copied over in one go would be read from the wrong
+    places. The mistake only shows on a matrix that is not square.
+    """
+    a = causa.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a.requires_grad = True
+    b = a.transpose(0, 1)
+    w = causa.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    loss = (b * w).sum()
+    g = loss.backward()
+
+    check("the gradient of a transpose is the transpose of the gradient",
+          g.tolist() == [[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]], f"got {g.tolist()}")
+
+
+def test_memory_capacity_is_bounded():
+    """A capacity decides how much memory is set aside, so it is checked.
+
+    A level has one slot struct for each of its slots, so a capacity of a
+    billion would ask for a billion of them before anything was stored.
+    """
+    raised = False
+    try:
+        causa.Memory(capacity=[10 ** 9, 128, 1024, 1024])
+    except (ValueError, RuntimeError):
+        raised = True
+    check("a capacity that is too large is refused", raised,
+          "the memory was made")
+
+    raised = False
+    try:
+        causa.Memory(capacity=[-1])
+    except (ValueError, RuntimeError):
+        raised = True
+    check("a negative capacity is refused", raised, "the memory was made")
+
+
 def main():
     print("=== Causa Python Bindings Tests ===\n")
 
@@ -298,6 +405,10 @@ def main():
         test_input_is_checked,
         test_serialization,
         test_repr,
+        test_leaf_backward_gives_no_tensor,
+        test_other_element_types_are_read_correctly,
+        test_transpose_gradient,
+        test_memory_capacity_is_bounded,
     ]
 
     for t in tests:

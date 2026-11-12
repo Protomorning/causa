@@ -4,6 +4,7 @@
 #include "causa_graph.h"
 #include "causa_memory.h"
 #include "causa_backend.h"
+#include "causa_linalg.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -74,6 +75,7 @@ causa_scm_t* causa_scm_new(
     scm->exogenous_noise = NULL;
     scm->num_exogenous = 0;
     scm->num_model_ops = -1;
+    scm->loss_op_count = 0;
     scm->num_topo = 0;
     {
         causa_config_t defaults = CAUSA_CONFIG_DEFAULTS;
@@ -97,7 +99,19 @@ causa_scm_t* causa_scm_new(
 }
 
 void causa_scm_free(causa_scm_t* scm) {
-    (void)scm;
+    if (!scm) return;
+
+    // The copy of the model that an intervention made has an arena of its
+    // own, and it is released here. The model it was made from belongs to
+    // the caller, and the arena it is in is not touched.
+    if (scm->intervened_arena) {
+        causa_arena_free(scm->intervened_arena);
+        scm->intervened_arena = NULL;
+        scm->intervened_graph = NULL;
+        scm->intervened_map = NULL;
+        scm->num_intervened_map = 0;
+        scm->intervened_source = NULL;
+    }
 }
 
 int causa_scm_from_graph(
@@ -193,6 +207,11 @@ int causa_scm_add_observed_variable(causa_scm_t* scm, causa_tensor_t* variable) 
 int causa_scm_add_exogenous(causa_scm_t* scm, causa_tensor_t* noise) {
     if (!scm || !noise) return -1;
 
+    // The noise terms are held in a list that the counterfactual step
+    // walks with a fixed size array, so the list has to stay inside that
+    // bound.
+    if (scm->num_exogenous >= CAUSA_MAX_VARIABLES) return -1;
+
     for (int32_t i = 0; i < scm->num_exogenous; i++) {
         if (scm->exogenous_noise[i] == noise) return 0;
     }
@@ -231,6 +250,19 @@ int causa_scm_build(causa_scm_t* scm) {
     return 0;
 }
 
+// True when the graph already holds the tensor.
+//
+// The graph is told about the tensors an operation writes, but not about
+// the ones it reads. A tensor that is read by two equations should only be
+// held once.
+static bool graph_knows_tensor(const causa_graph_t* g, const causa_tensor_t* t) {
+    if (!g || !t) return false;
+    for (int32_t i = 0; i < g->num_tensors; i++) {
+        if (g->tensors[i] == t) return true;
+    }
+    return false;
+}
+
 int causa_scm_add_equation_op(
     causa_scm_t* scm,
     causa_tensor_t* target,
@@ -258,6 +290,19 @@ int causa_scm_add_equation_op(
         inputs[n++] = parents[i];
     }
     inputs[n++] = noise;
+
+    // The parents and the noise have to be known to the graph. An operation
+    // only tells the graph about what it writes, so without this the
+    // surgery that copies the model for an intervention would not find
+    // these tensors and would quietly leave the model as it was.
+    //
+    // The same parent can be used by more than one equation, so a tensor
+    // the graph already knows is left alone.
+    for (int32_t i = 0; i < n; i++) {
+        if (!inputs[i]) continue;
+        if (graph_knows_tensor(g, inputs[i])) continue;
+        if (!causa_graph_add_tensor(g, inputs[i])) return -1;
+    }
 
     // The context has to outlive the op, so it is copied into the arena.
     void* ctx = NULL;
@@ -326,6 +371,17 @@ causa_tensor_t* causa_scm_add_reconstruction_loss(
         scm->num_model_ops = g->num_ops;
     }
 
+    // The loss of an earlier abduction is taken out before a new one is put
+    // in. Otherwise the graph would hold two losses, and the noise would be
+    // told about the error twice, which doubles the step the descent takes.
+    if (scm->loss_op_count > 0 &&
+        g->num_ops == scm->num_model_ops + scm->loss_op_count) {
+        g->num_ops -= scm->loss_op_count;
+        g->built = false;
+    }
+    scm->loss_op_count = 0;
+    int32_t ops_before = g->num_ops;
+
     for (int32_t i = 0; i < num_observed && i < scm->num_variables; i++) {
         causa_tensor_t* var = scm->variables[i].variable;
         causa_tensor_t* obs = observed[i];
@@ -389,6 +445,8 @@ causa_tensor_t* causa_scm_add_reconstruction_loss(
     g->built = false;
     causa_graph_build(g);
 
+    scm->loss_op_count = g->num_ops - ops_before;
+
     return total;
 }
 
@@ -438,26 +496,12 @@ causa_tensor_t* causa_scm_evaluate(
     // An intervened SCM built from a graph has its own copy of the graph, in
     // which the intervened variables take their constant values. Running it
     // gives the counterfactual values directly.
+    //
+    // The variables of such a model are the tensors the intervened graph
+    // writes into, so the values are already where the caller expects them
+    // and the model that was intervened on is left as it was.
     if (scm->intervened_graph && scm->intervened_map) {
         causa_graph_forward(scm->intervened_graph);
-
-        // Copy the values back onto the SCM's own tensors, so that the
-        // caller sees them where it expects them.
-        for (int32_t v = 0; v < scm->num_variables; v++) {
-            causa_tensor_t* var = scm->variables[v].variable;
-            if (!var) continue;
-
-            for (int32_t k = 0; k < scm->num_intervened_map; k++) {
-                // The map is indexed by the source graph's tensor order.
-                if (scm->intervened_map[k] && scm->base_graph &&
-                    k < scm->base_graph->num_tensors &&
-                    scm->base_graph->tensors[k] == var) {
-                    causa_tensor_copy(var, scm->intervened_map[k]);
-                    break;
-                }
-            }
-        }
-
         return result;
     }
 
@@ -479,9 +523,20 @@ causa_tensor_t* causa_scm_evaluate(
             // The intervened variable takes the constant value
             causa_tensor_copy(var->variable, var->intervention_value);
         } else if (var->structural_fn) {
+            // A structural function without parents has nothing to work
+            // from, so it is not called.
+            if (var->num_parents <= 0 || !var->parents) continue;
+
             causa_op_t tmp_op = {0};
-            tmp_op.inputs[0] = var->parents[0];
-            tmp_op.num_inputs = var->num_parents;
+            // Every parent is given to the function, not only the first
+            // one. A function that was given the wrong number of inputs
+            // would read whatever was in the rest of them.
+            int32_t n = var->num_parents;
+            if (n > CAUSA_MAX_OP_INPUTS) n = CAUSA_MAX_OP_INPUTS;
+            for (int32_t i = 0; i < n; i++) {
+                tmp_op.inputs[i] = var->parents[i];
+            }
+            tmp_op.num_inputs = n;
             tmp_op.outputs[0] = var->variable;
             tmp_op.num_outputs = 1;
             tmp_op.forward = var->structural_fn;
@@ -525,51 +580,6 @@ causa_tensor_t* causa_scm_sample(
     }
 
     return causa_scm_evaluate(scm, outputs, num_outputs);
-}
-
-// Solve a small dense system by Gaussian elimination with partial pivoting.
-//
-// The matrix is n x n and the right-hand side is b. The solution is written
-// into x. Returns false when the system has no unique solution.
-static bool causal_solve_dense(float* a, float* b, int32_t n, float* x) {
-    for (int32_t col = 0; col < n; col++) {
-        int32_t pivot = col;
-        float best = fabsf(a[col * n + col]);
-        for (int32_t r = col + 1; r < n; r++) {
-            float v = fabsf(a[r * n + col]);
-            if (v > best) { best = v; pivot = r; }
-        }
-        if (best < 1e-12f) return false;
-
-        if (pivot != col) {
-            for (int32_t c = 0; c < n; c++) {
-                float tmp = a[col * n + c];
-                a[col * n + c] = a[pivot * n + c];
-                a[pivot * n + c] = tmp;
-            }
-            float tmp = b[col];
-            b[col] = b[pivot];
-            b[pivot] = tmp;
-        }
-
-        float diag = a[col * n + col];
-        for (int32_t r = col + 1; r < n; r++) {
-            float factor = a[r * n + col] / diag;
-            if (factor == 0.0f) continue;
-            for (int32_t c = col; c < n; c++) a[r * n + c] -= factor * a[col * n + c];
-            b[r] -= factor * b[col];
-        }
-    }
-
-    for (int32_t r = n - 1; r >= 0; r--) {
-        float sum = b[r];
-        for (int32_t c = r + 1; c < n; c++) sum -= a[r * n + c] * x[c];
-        float diag = a[r * n + r];
-        if (fabsf(diag) < 1e-12f) return false;
-        x[r] = sum / diag;
-    }
-
-    return true;
 }
 
 // Regress a child on its parents and read off the coefficients.
@@ -630,7 +640,7 @@ static bool causal_refit_coefficients(
     // The ridge applies to the slopes only, so the intercept stays free.
     for (int32_t p = 1; p < n; p++) a[p * n + p] += 1e-3f;
 
-    bool ok = causal_solve_dense(a, b, n, x);
+    bool ok = causa_solve_dense(a, b, n, x);
     if (ok) {
         for (int32_t p = 0; p < k; p++) {
             // Back onto the scale of the data.
@@ -906,18 +916,34 @@ static causa_graph_t* scm_build_intervened_graph(
     causa_tensor_t** constants,
     int32_t num_interventions,
     causa_tensor_t*** out_map,
-    int32_t* out_map_count
+    int32_t* out_map_count,
+    causa_arena_t** out_arena
 ) {
-    causa_graph_t* src = scm->base_graph;
+    // The source is the graph the model was built from. A model that has
+    // already been intervened on has a graph of its own, in which the
+    // earlier intervention is already in place, and that is the graph the
+    // new copy is made from. Otherwise a second intervention would lose
+    // the first.
+    causa_graph_t* src = scm->intervened_graph ? scm->intervened_graph : scm->base_graph;
     if (!src || !src->built || num_interventions <= 0) return NULL;
 
-    causa_arena_t* arena = scm->arena;
     causa_backend_t* backend = scm->backend;
 
-    causa_graph_t* g = causa_graph_new(arena, backend);
+    // The copy of the model is put in an arena of its own, so that making
+    // an intervention does not make the arena of the model any bigger. It
+    // is released with the model that was intervened on.
+    size_t room = 64 * 1024;
+    for (int32_t i = 0; i < src->num_tensors; i++) {
+        room += causa_tensor_nbytes(src->tensors[i]) + 256;
+    }
+    causa_arena_t* copy_arena = causa_arena_new(room);
+    if (!copy_arena) return NULL;
+
+    causa_graph_t* g = causa_graph_new(copy_arena, backend);
 
     int32_t n = src->num_tensors;
-    causa_tensor_t** map = (causa_tensor_t**)causa_arena_alloc(arena, sizeof(causa_tensor_t*) * (n ? n : 1), CAUSA_ALIGNOF(causa_tensor_t*));
+    causa_tensor_t** map = (causa_tensor_t**)causa_arena_alloc(copy_arena, sizeof(causa_tensor_t*) * (n ? n : 1), CAUSA_ALIGNOF(causa_tensor_t*));
+    if (!map) { causa_arena_free(copy_arena); return NULL; }
 
     // One replacement tensor per source tensor
     for (int32_t i = 0; i < n; i++) {
@@ -927,8 +953,8 @@ static causa_graph_t* scm_build_intervened_graph(
         o.device = s->device;
         o.layout = s->layout;
         o.requires_grad = s->requires_grad;
-        map[i] = causa_tensor_new(arena, backend, s->shape, s->ndim, &o);
-        if (!map[i]) return NULL;
+        map[i] = causa_tensor_new(copy_arena, backend, s->shape, s->ndim, &o);
+        if (!map[i]) { causa_arena_free(copy_arena); return NULL; }
 
         // Carry the value over. Constants such as a coefficient live in the
         // source graph and are not produced by any operation, so without this
@@ -972,6 +998,7 @@ static causa_graph_t* scm_build_intervened_graph(
             }
             if (!inputs[j]) {
                 // An input that is not a graph tensor cannot be copied.
+                causa_arena_free(copy_arena);
                 return NULL;
             }
         }
@@ -991,15 +1018,30 @@ static causa_graph_t* scm_build_intervened_graph(
         // The op context has to outlive the op, so it is copied.
         void* ctx = NULL;
         if (op->ctx && op->ctx_size > 0) {
-            ctx = causa_arena_alloc(arena, op->ctx_size, 8);
-            if (!ctx) return NULL;
+            ctx = causa_arena_alloc(copy_arena, op->ctx_size, 8);
+            if (!ctx) { causa_arena_free(copy_arena); return NULL; }
             memcpy(ctx, op->ctx, op->ctx_size);
         }
 
         if (replaced_by >= 0 && op->num_outputs > 0) {
-            // The intervened variable takes the constant value
+            // The intervened variable takes the constant value.
+            //
+            // A copy of the constant is made, so that the copy of the
+            // model does not depend on the tensor the caller gave, and so
+            // that the constant is known to the graph: a copy of the copy
+            // would not be able to find it otherwise.
+            causa_tensor_t* c = constants[replaced_by];
+            causa_tensor_options_t co = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+            co.dtype = c->dtype;
+            co.device = c->device;
+            co.layout = c->layout;
+            causa_tensor_t* c_copy = causa_tensor_new(copy_arena, backend, c->shape, c->ndim, &co);
+            if (!c_copy) { causa_arena_free(copy_arena); return NULL; }
+            causa_tensor_copy(c_copy, c);
+            causa_graph_add_tensor(g, c_copy);
+
             causa_graph_add_op(g, CAUSA_OP_COPY, "intervened",
-                (causa_tensor_t*[]){constants[replaced_by]}, 1,
+                (causa_tensor_t*[]){c_copy}, 1,
                 (causa_tensor_t*[]){outputs[0]}, 1,
                 NULL, NULL, NULL, 0);
         } else {
@@ -1010,6 +1052,18 @@ static causa_graph_t* scm_build_intervened_graph(
         }
     }
 
+    // The copy has to know about the leaves of the model as well. A leaf
+    // is not the output of any operation, so the graph is not told about it
+    // when the operation is added, and a second copy of the copy could not
+    // find it.
+    for (int32_t i = 0; i < n; i++) {
+        bool known = false;
+        for (int32_t k = 0; k < g->num_tensors; k++) {
+            if (g->tensors[k] == map[i]) { known = true; break; }
+        }
+        if (!known) causa_graph_add_tensor(g, map[i]);
+    }
+
     // An intervened variable that no operation produced gets a copy added, so
     // that the consumers of it see the intervened value.
     for (int32_t iv = 0; iv < num_interventions; iv++) {
@@ -1017,8 +1071,19 @@ static causa_graph_t* scm_build_intervened_graph(
 
         for (int32_t k = 0; k < n; k++) {
             if (src->tensors[k] == targets[iv]) {
+                // The constant is copied, for the same reason as above.
+                causa_tensor_t* c = constants[iv];
+                causa_tensor_options_t co = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+                co.dtype = c->dtype;
+                co.device = c->device;
+                co.layout = c->layout;
+                causa_tensor_t* c_copy = causa_tensor_new(copy_arena, backend, c->shape, c->ndim, &co);
+                if (!c_copy) { causa_arena_free(copy_arena); return NULL; }
+                causa_tensor_copy(c_copy, c);
+                causa_graph_add_tensor(g, c_copy);
+
                 causa_graph_add_op(g, CAUSA_OP_COPY, "intervened",
-                    (causa_tensor_t*[]){constants[iv]}, 1,
+                    (causa_tensor_t*[]){c_copy}, 1,
                     (causa_tensor_t*[]){map[k]}, 1,
                     NULL, NULL, NULL, 0);
                 break;
@@ -1030,6 +1095,7 @@ static causa_graph_t* scm_build_intervened_graph(
 
     if (out_map) *out_map = map;
     if (out_map_count) *out_map_count = n;
+    if (out_arena) *out_arena = copy_arena;
     return g;
 }
 
@@ -1048,13 +1114,39 @@ static causa_scm_t* scm_do_internal(
     new_scm->exogenous_noise = scm->exogenous_noise;
     new_scm->base_graph = scm->base_graph;
 
+    // The settings travel with the model, so that a counterfactual on the
+    // intervened model behaves like one on the original.
+    new_scm->config = scm->config;
+
+    // The model this one was made from, so that a caller who intervenes
+    // on it again can give the target in terms of the model they started
+    // with.
+    new_scm->parent = scm;
+
     for (int32_t i = 0; i < scm->num_variables; i++) {
         new_scm->variables[i] = scm->variables[i];
     }
 
+    // The target is given in terms of the model the caller started with. A
+    // model that was itself made by an intervention holds a copy of the
+    // variables, so the target is found in the model this one was made
+    // from and the copy is used instead.
+    causa_tensor_t* real_targets[CAUSA_MAX_VARIABLES];
+    for (int32_t iv = 0; iv < num_interventions && iv < CAUSA_MAX_VARIABLES; iv++) {
+        real_targets[iv] = targets[iv];
+        if (scm->parent) {
+            for (int32_t i = 0; i < scm->parent->num_variables; i++) {
+                if (scm->parent->variables[i].variable == targets[iv]) {
+                    real_targets[iv] = scm->variables[i].variable;
+                    break;
+                }
+            }
+        }
+    }
+
     for (int32_t iv = 0; iv < num_interventions; iv++) {
         for (int32_t i = 0; i < new_scm->num_variables; i++) {
-            if (new_scm->variables[i].variable == targets[iv]) {
+            if (new_scm->variables[i].variable == real_targets[iv]) {
                 new_scm->variables[i].is_intervened = true;
                 new_scm->variables[i].intervention_value = values[iv];
                 break;
@@ -1065,21 +1157,95 @@ static causa_scm_t* scm_do_internal(
     memcpy(new_scm->topo_order, scm->topo_order, sizeof(int32_t) * scm->num_topo);
     new_scm->num_topo = scm->num_topo;
 
+    // The graph the new model is made from. A model that has already been
+    // intervened on has a graph of its own, and that is the one the new
+    // copy is made from.
+    causa_graph_t* source = scm->intervened_graph ? scm->intervened_graph : scm->base_graph;
+
+    // Where each variable sits in that graph. The intervened graph has a
+    // copy of every tensor of the source, and the copy of a variable is
+    // where the counterfactual value lands.
+    int32_t* var_index = (int32_t*)malloc(sizeof(int32_t) * (size_t)(scm->num_variables > 0 ? scm->num_variables : 1));
+    if (!var_index) return NULL;
+    for (int32_t i = 0; i < scm->num_variables; i++) {
+        var_index[i] = -1;
+        if (!scm->variables[i].variable || !source) continue;
+        for (int32_t k = 0; k < source->num_tensors; k++) {
+            if (source->tensors[k] == scm->variables[i].variable) {
+                var_index[i] = k;
+                break;
+            }
+        }
+    }
+
     // For a graph-based SCM, build a copy of the graph in which the
     // intervened variables take their constant values.
-    if (scm->base_graph && scm->base_graph->built && num_interventions > 0) {
+    if (source && source->built && num_interventions > 0) {
         causa_tensor_t** map = NULL;
         int32_t map_count = 0;
+        causa_arena_t* copy_arena = NULL;
 
-        causa_graph_t* ig = scm_build_intervened_graph(scm, targets, values,
-            num_interventions, &map, &map_count);
+        causa_graph_t* ig = scm_build_intervened_graph(scm, real_targets, values,
+            num_interventions, &map, &map_count, &copy_arena);
 
         if (ig) {
             new_scm->intervened_graph = ig;
             new_scm->intervened_map = map;
             new_scm->num_intervened_map = map_count;
+            new_scm->intervened_source = source;
+            new_scm->intervened_arena = copy_arena;
+
+            // The variables of the intervened model are the tensors the
+            // intervened graph writes into, so the values are already where
+            // they belong when it has run. The model that was intervened on
+            // keeps its own tensors and the values it had.
+            for (int32_t i = 0; i < new_scm->num_variables; i++) {
+                if (var_index[i] >= 0 && var_index[i] < map_count && map[var_index[i]]) {
+                    new_scm->variables[i].variable = map[var_index[i]];
+                }
+            }
         }
     }
+
+    if (!new_scm->intervened_graph) {
+        // A model whose equations are not operations of a graph is evaluated
+        // by walking its equations, so it needs tensors of its own. The
+        // values it computes must not land in the model it was made from.
+        causa_tensor_options_t o = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        o.dtype = CAUSA_DTYPE_F32;
+        o.device = CAUSA_DEVICE_CPU;
+
+        for (int32_t i = 0; i < new_scm->num_variables; i++) {
+            causa_tensor_t* var = scm->variables[i].variable;
+            if (!var) continue;
+
+            o.dtype = var->dtype;
+            o.device = var->device;
+            o.layout = var->layout;
+            o.requires_grad = var->requires_grad;
+
+            causa_tensor_t* copy = causa_tensor_new(scm->arena, scm->backend, var->shape, var->ndim, &o);
+            if (!copy) { free(var_index); return NULL; }
+            causa_tensor_copy(copy, var);
+            new_scm->variables[i].variable = copy;
+        }
+
+        // The parents point at the copies, so that the model works on its
+        // own values and not on those of the model it was made from.
+        for (int32_t i = 0; i < new_scm->num_variables; i++) {
+            for (int32_t p = 0; p < new_scm->variables[i].num_parents; p++) {
+                causa_tensor_t* parent = scm->variables[i].parents[p];
+                for (int32_t k = 0; k < new_scm->num_variables; k++) {
+                    if (scm->variables[k].variable == parent) {
+                        new_scm->variables[i].parents[p] = new_scm->variables[k].variable;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    free(var_index);
 
     new_scm->built = true;
     return new_scm;
@@ -1109,6 +1275,9 @@ causa_scm_t* causa_scm_do_multi(
     int32_t num_interventions
 ) {
     if (!scm || !targets || !values || num_interventions <= 0 || !scm->built) return NULL;
+    // The intervention count decides how much room the surgery needs on the
+    // stack, so it is checked against the bound before it is used.
+    if (num_interventions > CAUSA_MAX_VARIABLES) return NULL;
     return scm_do_internal(scm, targets, values, num_interventions);
 }
 
@@ -1155,6 +1324,27 @@ void causa_counterfactual_set_evidence(
     cf->num_evidence_vars = count;
 }
 
+// True when an operation of the model writes the variable.
+//
+// A variable that the graph produces is not pinned to its observed value:
+// the graph computes it, and the noise behind it is what the abduction
+// infers. A variable that nothing produces has only its observation.
+static bool scm_variable_is_produced(const causa_scm_t* scm, const causa_tensor_t* variable) {
+    causa_graph_t* g = scm->base_graph;
+    if (!g || !variable) return false;
+
+    int32_t model_ops = scm->num_model_ops >= 0 ? scm->num_model_ops : g->num_ops;
+    if (model_ops > g->num_ops) model_ops = g->num_ops;
+
+    for (int32_t i = 0; i < model_ops; i++) {
+        causa_op_t* op = g->ops[i];
+        for (int32_t j = 0; j < op->num_outputs; j++) {
+            if (op->outputs[j] == variable) return true;
+        }
+    }
+    return false;
+}
+
 // Step 1: Abduction - infer U from evidence
 //
 // The abduction solves for the exogenous noise that best explains the
@@ -1197,14 +1387,27 @@ int causa_counterfactual_abduction(
     for (int32_t step = 0; step < steps; step++) {
         causa_graph_zero_grad(g);
 
+        // The noise terms are not always tensors the graph knows about, and
+        // the gradient of one that is not would gather up over the steps
+        // instead of being the gradient of this step alone.
+        for (int32_t i = 0; i < scm->num_exogenous; i++) {
+            causa_tensor_t* noise = scm->exogenous_noise[i];
+            if (noise && noise->grad) causa_tensor_zero_grad(noise);
+        }
+
         // A variable with no equation of its own is pinned to its observed
-        // value, because that is the only information there is about it.
+        // value, because that is the only information there is about it. A
+        // variable the graph computes is left alone: the graph would write
+        // over the pin, and the noise behind the variable is what the
+        // abduction is meant to find.
         for (int32_t i = 0; i < scm->num_variables && i < cf->num_evidence_vars; i++) {
         const causa_scm_var_t* var = &scm->variables[i];
-            if (var->num_parents == 0 && !var->noise && var->variable && cf->evidence_vars[i]) {
+            if (var->num_parents == 0 && !var->noise && var->variable && cf->evidence_vars[i] &&
+                !scm_variable_is_produced(scm, var->variable)) {
                 causa_tensor_copy(var->variable, cf->evidence_vars[i]);
             }
         }
+
 
         causa_graph_forward(g);
 
@@ -1274,9 +1477,15 @@ int causa_counterfactual_prediction(
 ) {
     if (!cf || !scm || !cf->action_done) return -1;
 
-    // Set inferred noise into SCM
+    // The noise that was inferred is put in place, in case the abduction
+    // worked on a model of its own. It usually is the same tensor, and then
+    // there is nothing to do.
+    //
+    // The intervened graph was made after the abduction, so it already
+    // holds the noise that was inferred.
     for (int32_t i = 0; i < scm->num_exogenous; i++) {
-        if (cf->inferred_noise[i] && scm->exogenous_noise[i]) {
+        if (cf->inferred_noise[i] && scm->exogenous_noise[i] &&
+            cf->inferred_noise[i] != scm->exogenous_noise[i]) {
             causa_tensor_copy(scm->exogenous_noise[i], cf->inferred_noise[i]);
         }
     }
@@ -1292,9 +1501,41 @@ int causa_counterfactual_prediction(
     }
 
     // Forward pass
-    causa_scm_evaluate(int_scm, &cf->query, 1);
-    cf->result = cf->query;
+    causa_scm_evaluate(int_scm, NULL, 0);
 
+    // The values of an intervened model are in its own tensors, so the
+    // value of the variable that was asked about is taken from there.
+    //
+    // The map is indexed by the order of the graph the intervened graph was
+    // made from, so the variable is looked for in that graph.
+    causa_tensor_t* value = NULL;
+    causa_graph_t* source = int_scm->intervened_source;
+    if (source && int_scm->intervened_map) {
+        for (int32_t k = 0; k < source->num_tensors && k < int_scm->num_intervened_map; k++) {
+            if (source->tensors[k] == cf->query) {
+                value = int_scm->intervened_map[k];
+                break;
+            }
+        }
+    }
+    if (!value) {
+        // The variable is not one the model knows about, so it keeps the
+        // value it has.
+        value = cf->query;
+    }
+
+    // The result is a tensor of its own, so that the model that was asked
+    // about keeps the values it had.
+    causa_tensor_options_t o = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    o.dtype = cf->query->dtype;
+    o.device = cf->query->device;
+    o.layout = cf->query->layout;
+    causa_tensor_t* result = causa_tensor_new(cf->query->arena, cf->query->backend,
+                                              cf->query->shape, cf->query->ndim, &o);
+    if (!result) return -1;
+    causa_tensor_copy(result, value);
+
+    cf->result = result;
     cf->prediction_done = true;
     return 0;
 }
@@ -1307,8 +1548,11 @@ causa_tensor_t* causa_counterfactual_compute(
     if (!scm || !cf) return NULL;
 
     // Step 1: Abduction
-    causa_config_t config = CAUSA_CONFIG_DEFAULTS;
-    causa_counterfactual_abduction(cf, scm, config.counterfactual_lr, config.counterfactual_steps);
+    //
+    // The learning rate and the number of steps come from the model, so a
+    // caller can set them on the model rather than on every counterfactual.
+    causa_counterfactual_abduction(cf, scm, scm->config.counterfactual_lr,
+                                   scm->config.counterfactual_steps);
 
     // Step 2: Action
     causa_counterfactual_action(cf, scm);
@@ -1329,7 +1573,7 @@ int causa_counterfactual_compute_with_grad(
 ) {
     if (!scm || !cf || !grad_graph) return -1;
 
-    causa_config_t config = CAUSA_CONFIG_DEFAULTS;
+    causa_config_t config = scm->config;
     int32_t steps = config.counterfactual_steps;
     float lr = config.counterfactual_lr;
 
@@ -1371,7 +1615,10 @@ int causa_counterfactual_compute_with_grad(
 
         // Set variable noise
         for (int32_t v = 0; v < scm->num_variables; v++) {
-            if (scm->variables[v].noise) {
+            if (scm->variables[v].noise && scm->num_exogenous > 0) {
+                // A variable with noise of its own takes the noise term that
+                // stands in its place. A model with variables but no
+                // registered noise has nothing to take, so it is skipped.
                 int32_t ext_idx = v % scm->num_exogenous;
                 if (current_noise[ext_idx]) {
                     causa_tensor_copy(scm->variables[v].noise, current_noise[ext_idx]);
@@ -1379,8 +1626,10 @@ int causa_counterfactual_compute_with_grad(
             }
         }
 
-        // Forward pass through SCM
-        causa_scm_sample(scm, NULL, 0);
+        // Forward pass through the model. The noise was just put in place,
+        // so the model is evaluated rather than sampled: sampling would
+        // draw fresh noise and throw the estimate away.
+        causa_scm_evaluate(scm, NULL, 0);
 
         // Get prediction (query variable)
         causa_tensor_t* pred = cf->query;
@@ -1403,11 +1652,21 @@ int causa_counterfactual_compute_with_grad(
             (causa_tensor_t*[]){diff, diff}, 2,
             (causa_tensor_t*[]){sq}, 1, NULL, NULL, NULL, 0);
 
-        // Sum reduction
-        int32_t dims[] = {0};
+        // Sum reduction. The context says which dimensions are reduced, so
+        // it has to be a real reduction context: an operation reads it
+        // without checking how much of it there is.
+        causa_reduce_ctx_t* loss_ctx = (causa_reduce_ctx_t*)causa_arena_alloc(
+            scm->arena, sizeof(causa_reduce_ctx_t), 8);
+        if (!loss_ctx) return -1;
+        loss_ctx->reduce_op = CAUSA_REDUCE_SUM;
+        loss_ctx->num_dims = 1;
+        loss_ctx->dims[0] = 0;
+        loss_ctx->keepdim = false;
+
         causa_graph_add_op(grad_graph, CAUSA_OP_REDUCE, "cf_loss",
             (causa_tensor_t*[]){sq}, 1,
-            (causa_tensor_t*[]){loss}, 1, NULL, NULL, dims, sizeof(dims));
+            (causa_tensor_t*[]){loss}, 1,
+            NULL, NULL, loss_ctx, sizeof(causa_reduce_ctx_t));
 
         // Backward pass through graph to get gradients wrt current_noise
         causa_graph_zero_grad(grad_graph);
@@ -1496,9 +1755,18 @@ causa_tensor_t* causa_counterfactual_grad_wrt_intervention(
 
     // Return gradient w.r.t intervention value
     if (cf->intervention_val && cf->intervention_val->grad) {
-        causa_tensor_t* grad = causa_tensor_new(arena, scm->backend, cf->intervention_val->shape, cf->intervention_val->ndim,
-            &(causa_tensor_options_t){.dtype=CAUSA_DTYPE_F32, .device=CAUSA_DEVICE_CPU, .requires_grad=false});
-        causa_tensor_copy(grad, cf->intervention_val->grad);
+        // The gradient is made in the model's arena, not in the arena of
+        // the graph, so that it is still there when the caller has it.
+        // A gradient that pointed into an arena that was about to be freed
+        // would be a pointer to nothing.
+        causa_tensor_options_t gopts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+        gopts.dtype = cf->intervention_val->dtype;
+        gopts.device = cf->intervention_val->device;
+        causa_tensor_t* grad = causa_tensor_new(scm->arena, scm->backend,
+            cf->intervention_val->shape, cf->intervention_val->ndim, &gopts);
+        if (grad) {
+            causa_tensor_copy(grad, cf->intervention_val->grad);
+        }
         causa_graph_free(grad_graph);
         causa_arena_free(arena);
         return grad;
@@ -1563,15 +1831,36 @@ causa_discovery_t* causa_discover(
     causa_config_t cfg = CAUSA_CONFIG_DEFAULTS;
     if (config) cfg = *config;
 
-    int32_t D = (int32_t)observational_data->shape[observational_data->ndim - 1]; // variables
-    int32_t N = (int32_t)observational_data->shape[0]; // samples
-
     // The data has to be a matrix of samples and variables, and it has to
     // hold something. A sample count of zero would divide by zero when the
     // mean is worked out, and the whole fit would be a not-a-number.
+    //
+    // The shape is checked before it is read, because a tensor with no
+    // dimensions has no last dimension to read.
     if (observational_data->ndim != 2) return NULL;
+
+    int32_t D = (int32_t)observational_data->shape[1]; // variables
+    int32_t N = (int32_t)observational_data->shape[0]; // samples
+
     if (D <= 0 || N <= 0) return NULL;
     if (D > CAUSA_MAX_VARIABLES) return NULL;
+
+    // The data is read as floats. A tensor of another element type would be
+    // read with the wrong width, so it is refused rather than read wrongly.
+    if (observational_data->dtype != CAUSA_DTYPE_F32) return NULL;
+
+    // The interventional data, when there is any, has to fit the shape of
+    // the observational data. It is read the same way.
+    if (interventional_data) {
+        if (interventional_data->ndim != 2) return NULL;
+        if (interventional_data->dtype != CAUSA_DTYPE_F32) return NULL;
+        if (interventional_data->shape[1] != D) return NULL;
+        if (intervention_targets) {
+            if (intervention_targets->ndim != 1) return NULL;
+            if (intervention_targets->dtype != CAUSA_DTYPE_F32) return NULL;
+            if (intervention_targets->shape[0] != interventional_data->shape[0]) return NULL;
+        }
+    }
 
     causa_arena_t* arena = observational_data->arena;
     causa_discovery_t* disc = causa_discovery_new(arena, D);
@@ -1816,7 +2105,7 @@ causa_discovery_t* causa_discover(
     // Adam, which is what makes NOTEARS converge in practice. The augmented
     // Lagrangian multiplier is updated from the current constraint violation.
     int32_t max_iter = cfg.max_iterations > 0 ? cfg.max_iterations : 200;
-    float lr = 0.01f;
+    float lr = cfg.discovery_lr > 0.0f ? cfg.discovery_lr : 0.01f;
     const float beta1 = 0.9f;
     const float beta2 = 0.999f;
     const float eps = 1e-8f;
@@ -1983,20 +2272,34 @@ causa_discovery_t* causa_discover(
         const float* idata = (const float*)interventional_data->data;
         const float* itargets = (const float*)intervention_targets->data;
 
-        for (int32_t row = 0; row < M; row++) {
-            int32_t target = (int32_t)itargets[row];
-            if (target < 0 || target >= D) continue;
+        // The interventional samples are read as one row per sample, and
+        // the target of each row says which variable was intervened on. The
+        // samples that share a target are averaged together, so that the
+        // effect of an intervention is read from all of them and not from
+        // one at a time.
+        for (int32_t target = 0; target < D; target++) {
+            int32_t rows = 0;
+            for (int32_t row = 0; row < M; row++) {
+                if ((int32_t)itargets[row] == target) rows++;
+            }
+            if (rows == 0) continue;
 
             for (int32_t i = 0; i < D; i++) {
                 if (i == target) continue;
 
                 float int_mean = 0.0f;
-                for (int32_t n = 0; n < N; n++) {
+                for (int32_t row = 0; row < M; row++) {
+                    if ((int32_t)itargets[row] != target) continue;
                     int_mean += idata[row * D + i];
                 }
-                int_mean /= (float)N;
+                int_mean /= (float)rows;
 
-                if (fabsf(int_mean - obs_mean[i]) <= cfg.discovery_threshold) continue;
+                // The effect has to be larger than the threshold, measured
+                // in the size of the variable itself. The threshold is a
+                // number of standard deviations, so the difference is
+                // measured in them as well.
+                float difference = fabsf(int_mean - obs_mean[i]);
+                if (difference <= cfg.discovery_threshold * stddev[i]) continue;
 
                 // i responds to do(target): target is an ancestor of i.
                 if (disc->adjacency[i][target] && !disc->adjacency[target][i]) {
@@ -2004,7 +2307,11 @@ causa_discovery_t* causa_discover(
                     disc->adjacency[target][i] = 1;
                     disc->confidence[target][i] = disc->confidence[i][target];
                     disc->confidence[i][target] = 0.0f;
-                    disc->weights[target][i] = disc->weights[i][target];
+                    // The coefficient of a cause in an effect and the
+                    // coefficient of the effect in the cause are the same
+                    // size and the other way round, so the sign is turned
+                    // around with the edge.
+                    disc->weights[target][i] = -disc->weights[i][target];
                     disc->weights[i][target] = 0.0f;
 
                     for (int32_t k = 0; k < disc->num_parents[i]; k++) {
@@ -2026,6 +2333,19 @@ causa_discovery_t* causa_discover(
     causa_arena_free(opt_arena);
 
     return disc;
+}
+
+// The index of the variable a tensor belongs to, or -1 when the tensor is
+// not one of the model's variables.
+//
+// The variables of a model are registered in index order, which is the
+// order the discovery uses, so an index is what links the two together.
+static int32_t scm_variable_index(const causa_scm_t* scm, const causa_tensor_t* t) {
+    if (!t) return -1;
+    for (int32_t i = 0; i < scm->num_variables; i++) {
+        if (scm->variables[i].variable == t) return i;
+    }
+    return -1;
 }
 
 void causa_apply_discovery(
@@ -2057,7 +2377,31 @@ void causa_apply_discovery(
         }
         discovery->num_parents[child] = kept;
     }
+
+    // The model is pruned as well, so that it says the same as the
+    // discovery. A parent the data does not support is taken out of the
+    // variable's parent list, which is the structure the model records and
+    // the order its variables are evaluated in.
+    for (int32_t child = 0; child < scm->num_variables && child < discovery->num_variables; child++) {
+        causa_scm_var_t* var = &scm->variables[child];
+        if (var->num_parents <= 0) continue;
+
+        int32_t kept = 0;
+        for (int32_t p = 0; p < var->num_parents; p++) {
+            int32_t parent = scm_variable_index(scm, var->parents[p]);
+            if (parent < 0 || parent >= discovery->num_variables) continue;
+            if (!discovery->adjacency[parent][child]) continue;
+            var->parents[kept++] = var->parents[p];
+        }
+        var->num_parents = kept;
+    }
+
+    // The order the variables are evaluated in follows the parents, so it
+    // has to be worked out again.
+    scm->built = false;
+    causa_scm_build(scm);
 }
+
 
 int32_t causa_get_parents(
     causa_discovery_t* discovery,
@@ -2066,6 +2410,7 @@ int32_t causa_get_parents(
     int32_t max_parents
 ) {
     if (!discovery || var_idx < 0 || var_idx >= discovery->num_variables) return -1;
+    if (!out_parents || max_parents <= 0) return -1;
 
     int32_t count = 0;
     for (int32_t i = 0; i < discovery->num_parents[var_idx] && count < max_parents; i++) {
@@ -2238,9 +2583,42 @@ causa_tensor_t* causa_memory_store_counterfactual(
 ) {
     if (!memory || !cf || !cf->result) return NULL;
 
-    // Create key from (intervention_var, intervention_val, query)
-    // Store in episodic memory
-    return causa_memory_write(memory, cf->intervention_var, cf->result, CAUSA_MEMORY_EPISODIC);
+    // The counterfactual is kept with the situation it was asked in, and
+    // with the name of the variable it answers, so that it can be found
+    // again for that variable.
+    //
+    // The evidence is the situation. It holds one value per variable, with
+    // NaN where a variable was not observed.
+    const char* query_name = cf->query && cf->query->name[0] ? cf->query->name : NULL;
+    if (!query_name) return NULL;
+
+    int64_t dim = causa_memory_config(memory)->key_dim;
+    causa_arena_t* arena = causa_memory_arena(memory);
+    causa_backend_t* backend = causa_memory_backend(memory);
+
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_F32;
+    opts.device = CAUSA_DEVICE_CPU;
+    int64_t shape[] = {dim};
+
+    causa_tensor_t* context = causa_tensor_new(arena, backend, shape, 1, &opts);
+    if (!context) return NULL;
+
+    // The evidence is one tensor per variable. They are put side by side to
+    // make the situation the counterfactual was asked in.
+    float* ctx = (float*)context->data;
+    for (int64_t j = 0; j < dim; j++) {
+        float v = NAN;
+        if (cf->evidence_vars && j < cf->num_evidence_vars && cf->evidence_vars[j]) {
+            v = ((const float*)cf->evidence_vars[j]->data)[0];
+        }
+        ctx[j] = v;
+    }
+
+    int32_t stored = causa_memory_keep_counterfactual(memory, query_name, context, cf->result);
+    if (stored < 0) return NULL;
+
+    return cf->result;
 }
 
 causa_tensor_t* causa_memory_retrieve_counterfactuals(
@@ -2249,12 +2627,17 @@ causa_tensor_t* causa_memory_retrieve_counterfactuals(
     causa_tensor_t* context,
     int32_t k
 ) {
-    if (!memory || !query || !context) return NULL;
+    if (!memory || !query || !context || k <= 0) return NULL;
 
-    // Search episodic memory for similar counterfactuals
-    causa_tensor_t* keys[16];
-    causa_tensor_t* values[16];
-    return causa_memory_read_topk(memory, context, CAUSA_MEMORY_EPISODIC, k, keys, values);
+    const char* query_name = query->name[0] ? query->name : NULL;
+    if (!query_name) return NULL;
+
+    causa_tensor_t* results[16];
+    int32_t max = k < 16 ? k : 16;
+    int32_t found = causa_memory_find_counterfactuals(memory, query_name, context, max, results);
+    if (found <= 0) return NULL;
+
+    return results[0];
 }
 
 // ===== Utility =====

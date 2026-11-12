@@ -313,6 +313,125 @@ def test_intervention():
               f"got {numbers[1]}, expected 7.5")
 
 
+def test_persistence():
+    print("Testing persistence...")
+    with tempfile.TemporaryDirectory() as tmp:
+        # A memory that has learned something has to survive the trip
+        # through a file, otherwise the learned laws are lost when the
+        # process ends.
+        mem = causa.Memory(key_dim=3, value_dim=3)
+        for i in range(50):
+            x0 = (i % 10) * 0.1 - 0.5
+            x1 = 1.5 * x0 + 0.25
+            mem.write([x0, x1, 0.0], [x1, 0.0, 0.0], level="episodic")
+
+        # A memory holds one slot per distinct key, so the count is what
+        # the memory has rather than the number of writes.
+        before = mem.size("episodic")
+
+        path = os.path.join(tmp, "memory.bin")
+        mem.save(path)
+        check("the memory was written", os.path.exists(path))
+
+        loaded = causa.load_memory(path)
+        check("the memory was read", loaded is not None)
+        if loaded is None:
+            return
+
+        check("the memory kept its size", loaded.size("episodic") == before,
+              f"got {loaded.size('episodic')}, expected {before}")
+
+        found = loaded.read([0.0, 0.25, 0.0], level="episodic")
+        check("the memory kept its contents", found is not None)
+
+        # A model built from the laws has to survive too, and it has to
+        # still run afterwards. A model that loads but cannot be evaluated
+        # is no better than one that failed to load.
+        scm = mem.build_scm(3)
+        model_path = os.path.join(tmp, "scm.bin")
+        scm.save(model_path)
+        check("the model was written", os.path.exists(model_path))
+
+        loaded_scm = causa.load_scm(model_path)
+        check("the model was read", loaded_scm is not None)
+        if loaded_scm is None:
+            return
+
+        values = loaded_scm.evaluate()
+        check("the loaded model has its variables", len(values) == 3,
+              f"got {len(values)}")
+
+        # The loaded model must give the same answer as the one that was
+        # saved.
+        before = [v.tolist()[0] for v in scm.evaluate()]
+        after = [v.tolist()[0] for v in values]
+        check("the loaded model gives the same values",
+              all(abs(a - b) < 1e-4 for a, b in zip(before, after)),
+              f"got {after}, expected {before}")
+
+        # An intervention on the loaded model has to work too, since that
+        # is the reason to keep a model at all. The variable it acts on is
+        # the one the model was built around.
+        intervened = loaded_scm.do(values[0], 5.0)
+        check("the loaded model can be intervened on", intervened is not None)
+        if intervened is not None:
+            numbers = [v.tolist()[0] for v in intervened.evaluate()]
+            check("the intervention took effect", abs(numbers[0] - 5.0) < 1e-5,
+                  f"got {numbers[0]}")
+
+
+def test_counterfactuals_in_memory():
+    print("Testing counterfactuals in memory...")
+    mem = causa.Memory(key_dim=3, value_dim=3)
+
+    scm = causa.SCM()
+    x0 = scm.variable("x0")
+    x1 = scm.variable("x1")
+    u1 = scm.variable("u1", trainable=True)
+    scm.add_observed_variable(x0)
+    scm.add_equation(x1, [x0], u1, coefficient=1.5)
+    scm.build()
+
+    obs0 = causa.tensor([2.0])
+    obs1 = causa.tensor([3.5])
+
+    # Two counterfactuals about different variables, in the same situation.
+    cf_x1 = causa.Counterfactual(query=x1, intervention_var=x0,
+                                 intervention_val=causa.tensor([5.0]),
+                                 evidence=obs1)
+    cf_x1.set_evidence([obs0, obs1, obs1])
+    cf_x1.compute(scm)
+
+    x2 = scm.variable("x2")
+    cf_x2 = causa.Counterfactual(query=x2, intervention_var=x0,
+                                 intervention_val=causa.tensor([5.0]),
+                                 evidence=obs1)
+    cf_x2.set_evidence([obs0, obs1, obs1])
+    cf_x2.compute(scm)
+
+    cf_x1.store_in(mem)
+    cf_x2.store_in(mem)
+    check("the counterfactuals were kept", True)
+
+    # Asking about one variable must not return the other's.
+    found_x1 = mem.find_counterfactuals(x1, causa.tensor([2.0, 3.5, 0.0]), k=4)
+    check("one counterfactual was found for x1", len(found_x1) == 1,
+          f"got {len(found_x1)}")
+
+    found_x2 = mem.find_counterfactuals(x2, causa.tensor([2.0, 3.5, 0.0]), k=4)
+    check("one counterfactual was found for x2", len(found_x2) == 1,
+          f"got {len(found_x2)}")
+
+    if found_x1 and found_x2:
+        v1 = found_x1[0].tolist()[0]
+        v2 = found_x2[0].tolist()[0]
+        # x1 = 1.5 * 5 + 0.5 = 8.0
+        check("the x1 counterfactual is right", abs(v1 - 8.0) < 0.2,
+              f"got {v1}, expected about 8.0")
+        check("the two counterfactuals differ", abs(v1 - v2) > 0.5,
+              f"got {v1} and {v2}")
+
+
 def main():
     print("=== Causa Causal Bindings Tests ===\n")
 
@@ -326,6 +445,8 @@ def main():
         test_reasoning_over_memory,
         test_procedural_memory,
         test_intervention_planning,
+        test_counterfactuals_in_memory,
+        test_persistence,
     ]
 
     for t in tests:

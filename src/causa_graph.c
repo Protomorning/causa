@@ -85,16 +85,6 @@ static void get_standard_op_fns(causa_op_type_t type, causa_op_forward_fn* forwa
     }
 }
 
-static void graph_grow_nodes(causa_graph_t* graph) {
-    int32_t new_cap = graph->capacity_nodes ? graph->capacity_nodes * 2 : 64;
-    causa_node_t** new_nodes = (causa_node_t**)causa_arena_alloc(graph->arena, sizeof(causa_node_t*) * new_cap, CAUSA_ALIGNOF(causa_node_t*));
-    if (graph->nodes) {
-        memcpy(new_nodes, graph->nodes, graph->num_nodes * sizeof(causa_node_t*));
-    }
-    graph->nodes = new_nodes;
-    graph->capacity_nodes = new_cap;
-}
-
 static void graph_grow_tensors(causa_graph_t* graph) {
     int32_t new_cap = graph->capacity_tensors ? graph->capacity_tensors * 2 : 64;
     causa_tensor_t** new_tensors = (causa_tensor_t**)causa_arena_alloc(graph->arena, sizeof(causa_tensor_t*) * new_cap, CAUSA_ALIGNOF(causa_tensor_t*));
@@ -721,12 +711,44 @@ static void op_reduce_forward(causa_op_t* op) {
     op_store(op->outputs[0], r);
 }
 
+// The position in the output that an input element reduces to.
+//
+// The reduced axes collapse to zero and the ones that are kept keep their
+// own index.
+static int64_t reduce_out_index(
+    const causa_tensor_t* input,
+    const bool* reduce_mask,
+    const int64_t* out_strides,
+    bool keepdim,
+    const int64_t* idx
+) {
+    int64_t out_index = 0;
+    int32_t out_dim = 0;
+    for (int32_t i = 0; i < input->ndim; i++) {
+        if (reduce_mask[i]) {
+            if (keepdim) {
+                out_index += 0 * out_strides[out_dim];
+                out_dim++;
+            }
+        } else {
+            out_index += idx[i] * out_strides[out_dim];
+            out_dim++;
+        }
+    }
+    return out_index;
+}
+
 static void op_reduce_backward(causa_op_t* op, causa_tensor_t* grad_output) {
     const causa_reduce_ctx_t* ctx = (const causa_reduce_ctx_t*)op->ctx;
     if (!ctx || !grad_output) return;
 
     causa_tensor_t* input = op->inputs[0];
     if (!input || !input->requires_grad) return;
+
+    // The kernel below reads the elements as floats. A tensor of another
+    // element type would be read with the wrong width, so it is refused
+    // rather than read wrongly.
+    if (input->dtype != CAUSA_DTYPE_F32 || grad_output->dtype != CAUSA_DTYPE_F32) return;
 
     // Allocate the gradient buffer for the input if needed
     if (!input->grad) {
@@ -761,6 +783,7 @@ static void op_reduce_backward(causa_op_t* op, causa_tensor_t* grad_output) {
     const size_t esz = causa_dtype_size(input->dtype);
     float* gi = (float*)input->grad->data;
     const float* go = (const float*)grad_output->data;
+    const float* in_data = (const float*)input->data;
 
     // Walk every input element and find the matching output gradient.
     int64_t total = causa_tensor_numel(input);
@@ -776,6 +799,23 @@ static void op_reduce_backward(causa_op_t* op, causa_tensor_t* grad_output) {
         }
     }
 
+    // The values the reduction produced. The largest and the smallest tell
+    // which element of a group the gradient belongs to, and the product of
+    // the group tells the gradient of a product.
+    const float* out_values = NULL;
+    if (op->outputs && op->outputs[0] && op->outputs[0]->dtype == CAUSA_DTYPE_F32) {
+        out_values = (const float*)op->outputs[0]->data;
+    }
+
+    // The product of every group, for the product reduction. The gradient of
+    // a product is the product of the other elements, so the group has to be
+    // known before the elements are visited.
+    float* group_product = NULL;
+    if (ctx->reduce_op == CAUSA_REDUCE_PROD && go_numel > 0 && out_values) {
+        group_product = (float*)calloc((size_t)go_numel, sizeof(float));
+        if (!group_product) return;
+    }
+
     int64_t idx[CAUSA_MAX_DIMS];
     for (int32_t i = 0; i < input->ndim; i++) idx[i] = 0;
 
@@ -788,29 +828,87 @@ static void op_reduce_backward(causa_op_t* op, causa_tensor_t* grad_output) {
             rem /= dim_size;
         }
 
-        // Map to the output index: reduced axes collapse to 0
-        int64_t out_index = 0;
-        int32_t out_dim = 0;
-        for (int32_t i = 0; i < input->ndim; i++) {
-            if (reduce_mask[i]) {
-                if (ctx->keepdim) {
-                    out_index += 0 * out_strides[out_dim];
-                    out_dim++;
-                }
-            } else {
-                out_index += idx[i] * out_strides[out_dim];
-                out_dim++;
-            }
-        }
+        int64_t out_index = reduce_out_index(input, reduce_mask, out_strides, ctx->keepdim, idx);
 
-        // Input offset in elements
+        // Input offset in elements, in the layout of the input
         int64_t offset = 0;
         for (int32_t i = 0; i < input->ndim; i++) {
             offset += idx[i] * (input->strides[i] / (int64_t)esz);
         }
 
         float g = (out_index < go_numel) ? go[out_index] : 0.0f;
-        gi[offset] += g * scale;
+        float value = in_data[offset];
+
+        float share = g * scale;
+
+        switch (ctx->reduce_op) {
+            case CAUSA_REDUCE_MAX:
+                // The gradient belongs to the element that is the largest.
+                if (out_values && out_index < go_numel && value == out_values[out_index]) {
+                    share = g;
+                } else {
+                    share = 0.0f;
+                }
+                break;
+            case CAUSA_REDUCE_MIN:
+                // The gradient belongs to the element that is the smallest.
+                if (out_values && out_index < go_numel && value == out_values[out_index]) {
+                    share = g;
+                } else {
+                    share = 0.0f;
+                }
+                break;
+            case CAUSA_REDUCE_PROD:
+                // The gradient of a product is the product of the others.
+                if (group_product && out_index < go_numel) {
+                    group_product[out_index] *= value;
+                }
+                share = 0.0f;
+                break;
+            default:
+                break;
+        }
+
+        // The gradient is laid out in order, whatever the layout of the
+        // input is, so the position comes from the index and not from the
+        // strides. For a view the two are different, and the strides would
+        // point past the end of the gradient buffer.
+        gi[linear] += share;
+    }
+
+    // The products are only known once every element has been visited, so
+    // the product reduction is a second pass.
+    if (ctx->reduce_op == CAUSA_REDUCE_PROD && group_product) {
+        for (int32_t i = 0; i < input->ndim; i++) idx[i] = 0;
+
+        for (int64_t linear = 0; linear < total; linear++) {
+            int64_t rem = linear;
+            for (int32_t i = input->ndim - 1; i >= 0; i--) {
+                int64_t dim_size = input->shape[i];
+                idx[i] = rem % dim_size;
+                rem /= dim_size;
+            }
+
+            int64_t out_index = reduce_out_index(input, reduce_mask, out_strides, ctx->keepdim, idx);
+
+            int64_t offset = 0;
+            for (int32_t i = 0; i < input->ndim; i++) {
+                offset += idx[i] * (input->strides[i] / (int64_t)esz);
+            }
+
+            float value = in_data[offset];
+            float g = (out_index < go_numel) ? go[out_index] : 0.0f;
+
+            // The product of the others is the product of the group with
+            // this element taken out. A zero in the group makes it zero.
+            float others = 0.0f;
+            if (value != 0.0f) {
+                others = group_product[out_index] / value;
+            }
+            gi[linear] += g * others;
+        }
+
+        free(group_product);
     }
 }
 

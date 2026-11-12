@@ -189,6 +189,41 @@ void causa_tensor_store_f32(causa_tensor_t* t, int64_t index, float value) {
     }
 }
 
+// Read one element of a tensor as a float.
+//
+// A float32 tensor is read straight from its buffer, which is what the
+// arithmetic kernels do. Any other element type goes through the helpers,
+// so a kernel written this way works on every type rather than only on
+// float32.
+static inline float tensor_load_element(const causa_tensor_t* t, int64_t index) {
+    if (t->dtype == CAUSA_DTYPE_F32) return ((const float*)t->data)[index];
+    return causa_tensor_load_f32(t, index);
+}
+
+// Write one element of a tensor from a float.
+//
+// The counterpart of the loader above.
+static inline void tensor_store_element(causa_tensor_t* t, int64_t index, float value) {
+    if (t->dtype == CAUSA_DTYPE_F32) { ((float*)t->data)[index] = value; return; }
+    causa_tensor_store_f32(t, index, value);
+}
+
+// The position of an element in a tensor that is laid out in order.
+//
+// The gradient buffers are laid out in order, whatever the layout of the
+// tensor they belong to. A kernel that writes a gradient therefore has to
+// find the position from the shape and not from the strides: the strides of
+// a view point into a larger buffer, and the gradient does not.
+static int64_t tensor_row_major_offset(const causa_tensor_t* t, const int64_t* idx) {
+    int64_t off = 0;
+    int64_t stride = 1;
+    for (int32_t i = t->ndim - 1; i >= 0; i--) {
+        off += idx[i] * stride;
+        stride *= t->shape[i];
+    }
+    return off;
+}
+
 static void causa_default_dealloc(causa_tensor_t* tensor) {
     if (tensor->data && tensor->arena) {
         causa_arena_t* arena = tensor->arena;
@@ -230,12 +265,22 @@ causa_tensor_t* causa_tensor_new(
     if (options) opts = *options;
 
     size_t elem_size = causa_dtype_size(opts.dtype);
+    if (elem_size == 0) return NULL;   // an unknown element type has no size
+
     int64_t numel = 1;
     for (int32_t i = 0; i < ndim; i++) {
         if (shape[i] < 0) return NULL;
+        // The count of elements has to be exact. A product that overflows
+        // would give a buffer smaller than the shape says, and every index
+        // into the tensor would then be out of bounds.
+        if (shape[i] != 0 && numel > INT64_MAX / shape[i]) return NULL;
         numel *= shape[i];
     }
-    size_t nbytes = numel * elem_size;
+
+    // The same for the size in bytes: a count that fits in the shape has
+    // to fit in the buffer as well.
+    if ((uint64_t)numel > (uint64_t)(SIZE_MAX / elem_size)) return NULL;
+    size_t nbytes = (size_t)numel * elem_size;
 
     void* data = causa_arena_alloc(arena, nbytes, 64);
     if (!data) return NULL;
@@ -537,14 +582,36 @@ size_t causa_tensor_nbytes(const causa_tensor_t* tensor) {
 
 causa_tensor_t* causa_tensor_to_device(causa_tensor_t* tensor, causa_device_type_t device) {
     if (!tensor || tensor->device == device) return tensor;
+
+    // There is one device. A tensor that is asked to go somewhere else is
+    // refused rather than copied and left behind.
     (void)device;
     return NULL;
 }
 
 causa_tensor_t* causa_tensor_to_dtype(causa_tensor_t* tensor, causa_dtype_t dtype) {
     if (!tensor || tensor->dtype == dtype) return tensor;
-    (void)dtype;
-    return NULL;
+    if (dtype < 0 || dtype >= CAUSA_DTYPE_COUNT) return NULL;
+
+    // The values are read and written through the helpers, so the change of
+    // type is a change of how the numbers are written down and not a change
+    // of what they are.
+    int64_t n = causa_tensor_numel(tensor);
+
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = dtype;
+    opts.device = tensor->device;
+    opts.layout = tensor->layout;
+    opts.requires_grad = tensor->requires_grad;
+
+    causa_tensor_t* out = causa_tensor_new(tensor->arena, tensor->backend, tensor->shape, tensor->ndim, &opts);
+    if (!out) return NULL;
+
+    for (int64_t i = 0; i < n; i++) {
+        causa_tensor_store_f32(out, i, causa_tensor_load_f32(tensor, i));
+    }
+
+    return out;
 }
 
 void causa_tensor_fill(causa_tensor_t* tensor, double value) {
@@ -562,33 +629,47 @@ void causa_tensor_fill(causa_tensor_t* tensor, double value) {
 
 void causa_tensor_copy(causa_tensor_t* dst, const causa_tensor_t* src) {
     if (!dst || !src) return;
-    if (dst->dtype != src->dtype) return;
 
     int64_t dn = causa_tensor_numel(dst);
     int64_t sn = causa_tensor_numel(src);
+    if (dn == 0 || sn == 0) return;
 
-    if (dn == sn) {
+    const int64_t elem_size = (int64_t)causa_dtype_size(src->dtype);
+
+    if (dn == sn && dst->dtype == src->dtype) {
         if (causa_tensor_is_contiguous(src) && causa_tensor_is_contiguous(dst)) {
             memcpy(dst->data, src->data, causa_tensor_nbytes(src));
             return;
         }
 
         // A source that is not laid out in order is copied element by
-        // element, following its strides.
-        int64_t elem_size = (int64_t)causa_dtype_size(src->dtype);
-        int64_t index[CAUSA_MAX_DIMS];
-        for (int32_t i = 0; i < src->ndim; i++) index[i] = 0;
+        // element, following the strides of both tensors. The place of an
+        // element in the destination comes from the destination and not from
+        // the source, or the values would land in the wrong places for a
+        // destination that is not laid out in order.
+        int64_t src_index[CAUSA_MAX_DIMS];
+        int64_t dst_index[CAUSA_MAX_DIMS];
+        for (int32_t i = 0; i < src->ndim; i++) src_index[i] = 0;
+        for (int32_t i = 0; i < dst->ndim; i++) dst_index[i] = 0;
 
         for (int64_t n = 0; n < sn; n++) {
-            int64_t offset = 0;
+            int64_t src_offset = 0;
             for (int32_t i = 0; i < src->ndim; i++) {
-                offset += index[i] * (src->strides[i] / elem_size);
+                src_offset += src_index[i] * (src->strides[i] / elem_size);
             }
-            causa_tensor_store_f32(dst, offset, causa_tensor_load_f32(src, offset));
+            int64_t dst_offset = 0;
+            for (int32_t i = 0; i < dst->ndim; i++) {
+                dst_offset += dst_index[i] * (dst->strides[i] / elem_size);
+            }
+            causa_tensor_store_f32(dst, dst_offset, causa_tensor_load_f32(src, src_offset));
 
             for (int32_t i = src->ndim - 1; i >= 0; i--) {
-                if (++index[i] < src->shape[i]) break;
-                index[i] = 0;
+                if (++src_index[i] < src->shape[i]) break;
+                src_index[i] = 0;
+            }
+            for (int32_t i = dst->ndim - 1; i >= 0; i--) {
+                if (++dst_index[i] < dst->shape[i]) break;
+                dst_index[i] = 0;
             }
         }
         return;
@@ -606,6 +687,72 @@ void causa_tensor_copy(causa_tensor_t* dst, const causa_tensor_t* src) {
     if (dn == 1) {
         causa_tensor_store_f32(dst, 0, causa_tensor_load_f32(src, 0));
         return;
+    }
+
+    // The two tensors do not have the same number of elements and neither
+    // of them has only one. The part that both of them have is copied, so
+    // that a copy is never quietly nothing: the values are matched in the
+    // order they are laid out in.
+    int64_t count = dn < sn ? dn : sn;
+
+    int64_t src_index[CAUSA_MAX_DIMS];
+    int64_t dst_index[CAUSA_MAX_DIMS];
+    for (int32_t i = 0; i < src->ndim; i++) src_index[i] = 0;
+    for (int32_t i = 0; i < dst->ndim; i++) dst_index[i] = 0;
+
+    for (int64_t n = 0; n < count; n++) {
+        int64_t src_offset = 0;
+        for (int32_t i = 0; i < src->ndim; i++) {
+            src_offset += src_index[i] * (src->strides[i] / elem_size);
+        }
+        int64_t dst_offset = 0;
+        for (int32_t i = 0; i < dst->ndim; i++) {
+            dst_offset += dst_index[i] * (dst->strides[i] / elem_size);
+        }
+        causa_tensor_store_f32(dst, dst_offset, causa_tensor_load_f32(src, src_offset));
+
+        for (int32_t i = src->ndim - 1; i >= 0; i--) {
+            if (++src_index[i] < src->shape[i]) break;
+            src_index[i] = 0;
+        }
+        for (int32_t i = dst->ndim - 1; i >= 0; i--) {
+            if (++dst_index[i] < dst->shape[i]) break;
+            dst_index[i] = 0;
+        }
+    }
+}
+
+// A random number between zero and one that is never zero.
+//
+// The formula for a normal number takes the logarithm of a number that must
+// not be zero, and the random source does give zero now and then. A value
+// that is small but not zero keeps the number finite.
+static float random_positive(void) {
+    float u = (float)rand() / RAND_MAX;
+    if (u <= 1e-7f) u = 1e-7f;
+    return u;
+}
+
+// A random number with a normal distribution.
+static float random_normal(float mean, float std) {
+    float u1 = random_positive();
+    float u2 = (float)rand() / RAND_MAX;
+    float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265359f * u2);
+    return mean + std * z;
+}
+
+// The number of values that come in and the number that go out.
+//
+// A tensor with fewer than two dimensions is treated as a single row, so
+// that the scale of the weights can still be worked out.
+static void tensor_fan(causa_tensor_t* tensor, int64_t* fan_in, int64_t* fan_out) {
+    *fan_in = 1;
+    *fan_out = 1;
+    if (tensor->ndim >= 2) {
+        *fan_in = tensor->shape[tensor->ndim - 2];
+        *fan_out = tensor->shape[tensor->ndim - 1];
+    } else if (tensor->ndim == 1) {
+        *fan_out = tensor->shape[0];
     }
 }
 
@@ -633,33 +780,117 @@ void causa_tensor_init(causa_tensor_t* tensor, causa_init_t init, double param1,
             float mean = (float)param1;
             float std = (float)param2;
             for (int64_t i = 0; i < n; i++) {
-                float u1 = (float)rand() / RAND_MAX;
-                float u2 = (float)rand() / RAND_MAX;
-                float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265359f * u2);
-                causa_tensor_store_f32(tensor, i, mean + std * z);
+                causa_tensor_store_f32(tensor, i, random_normal(mean, std));
             }
             break;
         }
         case CAUSA_INIT_XAVIER_UNIFORM: {
-            int64_t fan_in = 1, fan_out = 1;
-            if (tensor->ndim >= 2) {
-                fan_in = tensor->shape[tensor->ndim - 2];
-                fan_out = tensor->shape[tensor->ndim - 1];
-            }
-            float limit = sqrtf(6.0f / (float)(fan_in + fan_out));
+            int64_t fan_in, fan_out;
+            tensor_fan(tensor, &fan_in, &fan_out);
+            float gain = (float)param1;
+            float limit = gain * sqrtf(6.0f / (float)(fan_in + fan_out));
             for (int64_t i = 0; i < n; i++) {
                 float v = -limit + 2.0f * limit * ((float)rand() / RAND_MAX);
                 causa_tensor_store_f32(tensor, i, v);
             }
             break;
         }
+        case CAUSA_INIT_XAVIER_NORMAL: {
+            int64_t fan_in, fan_out;
+            tensor_fan(tensor, &fan_in, &fan_out);
+            float gain = (float)param1;
+            float mean = (float)param2;
+            float std = gain * sqrtf(2.0f / (float)(fan_in + fan_out));
+            for (int64_t i = 0; i < n; i++) {
+                causa_tensor_store_f32(tensor, i, random_normal(mean, std));
+            }
+            break;
+        }
         case CAUSA_INIT_KAIMING_UNIFORM: {
-            int64_t fan_in = 1;
-            if (tensor->ndim >= 2) fan_in = tensor->shape[tensor->ndim - 2];
-            float limit = sqrtf(3.0f / (float)fan_in);
+            int64_t fan_in, fan_out;
+            tensor_fan(tensor, &fan_in, &fan_out);
+            (void)fan_out;
+            float gain = (float)param1;
+            float limit = gain * sqrtf(3.0f / (float)fan_in);
             for (int64_t i = 0; i < n; i++) {
                 float v = -limit + 2.0f * limit * ((float)rand() / RAND_MAX);
                 causa_tensor_store_f32(tensor, i, v);
+            }
+            break;
+        }
+        case CAUSA_INIT_KAIMING_NORMAL: {
+            int64_t fan_in, fan_out;
+            tensor_fan(tensor, &fan_in, &fan_out);
+            (void)fan_out;
+            float gain = (float)param1;
+            float mean = (float)param2;
+            float std = gain * sqrtf(2.0f / (float)fan_in);
+            for (int64_t i = 0; i < n; i++) {
+                causa_tensor_store_f32(tensor, i, random_normal(mean, std));
+            }
+            break;
+        }
+        case CAUSA_INIT_ORTHOGONAL: {
+            // A matrix whose rows are at right angles to each other.
+            //
+            // A matrix of random numbers is made first, and then each row
+            // is put at right angles to the rows that came before it. That
+            // is what makes the result.
+            int64_t rows = tensor->ndim >= 2 ? tensor->shape[tensor->ndim - 2] : 1;
+            int64_t cols = tensor->ndim >= 1 ? tensor->shape[tensor->ndim - 1] : 1;
+            if (rows <= 0 || cols <= 0) break;
+
+            // The matrix is worked on in a buffer of its own, because the
+            // rows are put at right angles in place.
+            float* work = (float*)calloc((size_t)(rows * cols), sizeof(float));
+            if (!work) break;
+            for (int64_t i = 0; i < rows * cols; i++) {
+                work[i] = -1.0f + 2.0f * ((float)rand() / RAND_MAX);
+            }
+
+            for (int64_t r = 0; r < rows; r++) {
+                // Take out whatever is in the same direction from the
+                // rows that have already been made. The whole row is
+                // looked at, because the direction of a row is a property
+                // of the row and not of one of its elements.
+                for (int64_t p = 0; p < r; p++) {
+                    float dot = 0.0f;
+                    for (int64_t c = 0; c < cols; c++) {
+                        dot += work[r * cols + c] * work[p * cols + c];
+                    }
+                    for (int64_t c = 0; c < cols; c++) {
+                        work[r * cols + c] -= dot * work[p * cols + c];
+                    }
+                }
+
+                // Give the row the same length as the ones before it.
+                float norm = 0.0f;
+                for (int64_t c = 0; c < cols; c++) norm += work[r * cols + c] * work[r * cols + c];
+                norm = sqrtf(norm);
+                if (norm < 1e-6f) {
+                    // A row that is all zeros cannot be put at right angles
+                    // to anything, so it is given a direction of its own.
+                    for (int64_t c = 0; c < cols; c++) work[r * cols + c] = 0.0f;
+                    work[r * cols + (r < cols ? r : 0)] = 1.0f;
+                    norm = 1.0f;
+                }
+                for (int64_t c = 0; c < cols; c++) work[r * cols + c] /= norm;
+            }
+
+            for (int64_t i = 0; i < rows * cols && i < n; i++) {
+                causa_tensor_store_f32(tensor, i, work[i]);
+            }
+            free(work);
+            break;
+        }
+        case CAUSA_INIT_EYE: {
+            // A matrix with ones along its diagonal.
+            int64_t rows = tensor->ndim >= 2 ? tensor->shape[tensor->ndim - 2] : 1;
+            int64_t cols = tensor->ndim >= 1 ? tensor->shape[tensor->ndim - 1] : 1;
+            causa_tensor_fill(tensor, 0.0);
+            int64_t diag = rows < cols ? rows : cols;
+            for (int64_t r = 0; r < diag; r++) {
+                causa_tensor_store_f32(tensor, r * cols + r, 1.0f);
             }
             break;
         }
@@ -705,10 +936,7 @@ causa_tensor_t* causa_tensor_reduce(
     causa_tensor_t* out = causa_tensor_new(input->arena, input->backend, out_shape, out_ndim, &opts);
     if (!out) return NULL;
 
-    if (input->dtype == CAUSA_DTYPE_F32) {
-        int64_t in_strides[CAUSA_MAX_DIMS];
-        memcpy(in_strides, input->strides, input->ndim * sizeof(int64_t));
-
+    {
         int64_t out_strides[CAUSA_MAX_DIMS];
         if (out_ndim > 0) {
             out_strides[out_ndim - 1] = 1;
@@ -718,6 +946,12 @@ causa_tensor_t* causa_tensor_reduce(
         }
 
         int64_t numel_out = causa_tensor_numel(out);
+
+        // The stride of a dimension is kept in bytes and the elements are
+        // counted, so the conversion is made here. The element size of the
+        // tensor is the one that counts: a double takes two strides where a
+        // float takes one.
+        const int64_t esz = (int64_t)causa_dtype_size(input->dtype);
 
         for (int64_t o = 0; o < numel_out; o++) {
             int64_t idx[CAUSA_MAX_DIMS];
@@ -765,10 +999,10 @@ causa_tensor_t* causa_tensor_reduce(
                 int64_t offset = 0;
                 for (int32_t i = 0; i < input->ndim; i++) {
                     int64_t i_idx = reduce_mask[i] ? reduce_idx[i] : in_idx[i];
-                    offset += i_idx * (input->strides[i] / (int64_t)sizeof(float));
+                    offset += i_idx * (input->strides[i] / esz);
                 }
 
-                float val = ((const float*)input->data)[offset];
+                float val = tensor_load_element(input, offset);
 
                 switch (op) {
                     case CAUSA_REDUCE_SUM:
@@ -797,13 +1031,17 @@ causa_tensor_t* causa_tensor_reduce(
                 first = false;
             }
 
-            if (op == CAUSA_REDUCE_MEAN) {
+            // A reduction over nothing has nothing to divide by. The sum of
+            // nothing is nothing and the product of nothing is one.
+            if (reduce_size == 0) {
+                acc = (op == CAUSA_REDUCE_PROD) ? 1.0f : 0.0f;
+            } else if (op == CAUSA_REDUCE_MEAN) {
                 acc /= reduce_size;
             } else if (op == CAUSA_REDUCE_NORM_L2) {
                 acc = sqrtf(acc);
             }
 
-            ((float*)out->data)[o] = acc;
+            tensor_store_element(out, o, acc);
         }
     }
 
@@ -815,8 +1053,71 @@ causa_tensor_t* causa_tensor_compare(
     const causa_tensor_t* b,
     causa_cmp_op_t op
 ) {
-    (void)a; (void)b; (void)op;
-    return NULL;
+    if (!a || !b) return NULL;
+
+    // The two tensors are compared element by element, so they have to
+    // have the same shape. The result of a comparison is a yes or a no
+    // for every element, so it is a byte per element.
+    if (a->ndim != b->ndim) return NULL;
+    for (int32_t i = 0; i < a->ndim; i++) {
+        if (a->shape[i] != b->shape[i]) return NULL;
+    }
+
+    int64_t n = causa_tensor_numel(a);
+
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_BOOL;
+    opts.device = a->device;
+    opts.layout = a->layout;
+    opts.requires_grad = false;
+
+    causa_tensor_t* out = causa_tensor_new(a->arena, a->backend, a->shape, a->ndim, &opts);
+    if (!out) return NULL;
+
+    const int64_t a_elem = (int64_t)causa_dtype_size(a->dtype);
+    const int64_t b_elem = (int64_t)causa_dtype_size(b->dtype);
+
+    int64_t a_index[CAUSA_MAX_DIMS];
+    int64_t b_index[CAUSA_MAX_DIMS];
+    for (int32_t i = 0; i < a->ndim; i++) { a_index[i] = 0; b_index[i] = 0; }
+
+    for (int64_t i = 0; i < n; i++) {
+        int64_t a_offset = 0;
+        for (int32_t d = 0; d < a->ndim; d++) {
+            a_offset += a_index[d] * (a->strides[d] / a_elem);
+        }
+        int64_t b_offset = 0;
+        for (int32_t d = 0; d < b->ndim; d++) {
+            b_offset += b_index[d] * (b->strides[d] / b_elem);
+        }
+
+        float x = causa_tensor_load_f32(a, a_offset);
+        float y = causa_tensor_load_f32(b, b_offset);
+
+        bool result = false;
+        switch (op) {
+            case CAUSA_CMP_EQ: result = (x == y); break;
+            case CAUSA_CMP_NE: result = (x != y); break;
+            case CAUSA_CMP_LT: result = (x < y); break;
+            case CAUSA_CMP_LE: result = (x <= y); break;
+            case CAUSA_CMP_GT: result = (x > y); break;
+            case CAUSA_CMP_GE: result = (x >= y); break;
+            default: break;
+        }
+
+        causa_tensor_store_f32(out, i, result ? 1.0f : 0.0f);
+
+        for (int32_t d = a->ndim - 1; d >= 0; d--) {
+            if (++a_index[d] < a->shape[d]) break;
+            a_index[d] = 0;
+        }
+        for (int32_t d = b->ndim - 1; d >= 0; d--) {
+            if (++b_index[d] < b->shape[d]) break;
+            b_index[d] = 0;
+        }
+    }
+
+    return out;
 }
 
 causa_tensor_t* causa_tensor_activation(const causa_tensor_t* input, causa_activation_t act, double param) {
@@ -1046,32 +1347,32 @@ causa_tensor_t* causa_tensor_bmm(const causa_tensor_t* a, const causa_tensor_t* 
     causa_tensor_t* out = causa_tensor_new(a->arena, a->backend, out_shape, 3, &opts);
     if (!out) return NULL;
 
-    if (a->dtype == CAUSA_DTYPE_F32) {
-        const float* A = (const float*)a->data;
-        const float* B = (const float*)b->data;
-        float* C = (float*)out->data;
-
-        const size_t esz = sizeof(float);
-        int64_t stride_a_batch = a->strides[0] / (int64_t)esz;
-        int64_t stride_b_batch = b->strides[0] / (int64_t)esz;
-        int64_t stride_out_batch = out->strides[0] / (int64_t)esz;
+    {
+        // The strides are kept in bytes and the elements are counted, so
+        // the conversion is made here. The element size of the tensor is
+        // the one that counts.
+        const int64_t esz = (int64_t)causa_dtype_size(a->dtype);
+        int64_t stride_a_batch = a->strides[0] / esz;
+        int64_t stride_b_batch = b->strides[0] / esz;
+        int64_t stride_out_batch = out->strides[0] / esz;
 
         for (int64_t b_idx = 0; b_idx < batch; b_idx++) {
-            const float* a_ptr = A + b_idx * stride_a_batch;
-            const float* b_ptr = B + b_idx * stride_b_batch;
-            float* c_ptr = C + b_idx * stride_out_batch;
+            int64_t a_base = b_idx * stride_a_batch;
+            int64_t b_base = b_idx * stride_b_batch;
+            int64_t c_base = b_idx * stride_out_batch;
 
-            int64_t lda = a->strides[1] / (int64_t)esz;
-            int64_t ldb = b->strides[1] / (int64_t)esz;
-            int64_t ldc = out->strides[1] / (int64_t)esz;
+            int64_t lda = a->strides[1] / esz;
+            int64_t ldb = b->strides[1] / esz;
+            int64_t ldc = out->strides[1] / esz;
 
             for (int64_t i = 0; i < M; i++) {
                 for (int64_t j = 0; j < N; j++) {
                     float sum = 0.0f;
                     for (int64_t k = 0; k < K; k++) {
-                        sum += a_ptr[i * lda + k] * b_ptr[k * ldb + j];
+                        sum += tensor_load_element(a, a_base + i * lda + k) *
+                               tensor_load_element(b, b_base + k * ldb + j);
                     }
-                    c_ptr[i * ldc + j] = sum;
+                    tensor_store_element(out, c_base + i * ldc + j, sum);
                 }
             }
         }
@@ -1091,6 +1392,10 @@ causa_tensor_t* causa_tensor_conv1d(
 ) {
     if (!input || !weight || input->dtype != weight->dtype) return NULL;
     if (input->ndim != 3 || weight->ndim != 3) return NULL;
+    // The groups divide the channels up, so a number of groups that is not
+    // a positive count would divide by zero.
+    if (groups <= 0) return NULL;
+    if (stride <= 0 || dilation <= 0) return NULL;
 
     int64_t N = input->shape[0];
     int64_t C_in = input->shape[1];
@@ -1111,22 +1416,22 @@ causa_tensor_t* causa_tensor_conv1d(
     causa_tensor_t* out = causa_tensor_new(input->arena, input->backend, out_shape, 3, &opts);
     if (!out) return NULL;
 
-    if (input->dtype == CAUSA_DTYPE_F32) {
-        const float* in = (const float*)input->data;
-        const float* w = (const float*)weight->data;
-        const float* b = bias ? (const float*)bias->data : NULL;
-        float* out_data = (float*)out->data;
+    {
+        // The strides are kept in bytes and the elements are counted, so
+        // the conversion is made here.
+        const int64_t esz = (int64_t)causa_dtype_size(input->dtype);
 
-        int64_t in_stride_n = input->strides[0] / (int64_t)sizeof(float);
-        int64_t in_stride_c = input->strides[1] / (int64_t)sizeof(float);
-        int64_t in_stride_l = input->strides[2] / (int64_t)sizeof(float);
+        int64_t in_stride_n = input->strides[0] / esz;
+        int64_t in_stride_c = input->strides[1] / esz;
+        int64_t in_stride_l = input->strides[2] / esz;
 
-        int64_t w_stride_c = weight->strides[1] / (int64_t)sizeof(float);
-        int64_t w_stride_k = weight->strides[2] / (int64_t)sizeof(float);
+        int64_t w_stride_o = weight->strides[0] / esz;
+        int64_t w_stride_c = weight->strides[1] / esz;
+        int64_t w_stride_k = weight->strides[2] / esz;
 
-        int64_t out_stride_n = out->strides[0] / (int64_t)sizeof(float);
-        int64_t out_stride_c = out->strides[1] / (int64_t)sizeof(float);
-        int64_t out_stride_l = out->strides[2] / (int64_t)sizeof(float);
+        int64_t out_stride_n = out->strides[0] / esz;
+        int64_t out_stride_c = out->strides[1] / esz;
+        int64_t out_stride_l = out->strides[2] / esz;
 
         for (int64_t n = 0; n < N; n++) {
             for (int64_t c_out = 0; c_out < C_out; c_out++) {
@@ -1142,15 +1447,15 @@ causa_tensor_t* causa_tensor_conv1d(
                         for (int64_t kk = 0; kk < k; kk++) {
                             int64_t l_in = l_in_start + kk * dilation;
                             if (l_in >= 0 && l_in < L_in) {
-                                float in_val = in[n * in_stride_n + c_in * in_stride_c + l_in * in_stride_l];
-                                float w_val = w[c_out * (weight->strides[0] / (int64_t)sizeof(float)) + (c_in - c_in_start) * w_stride_c + kk * w_stride_k];
+                                float in_val = tensor_load_element(input, n * in_stride_n + c_in * in_stride_c + l_in * in_stride_l);
+                                float w_val = tensor_load_element(weight, c_out * w_stride_o + (c_in - c_in_start) * w_stride_c + kk * w_stride_k);
                                 sum += in_val * w_val;
                             }
                         }
                     }
 
-                    if (b) sum += b[c_out];
-                    out_data[n * out_stride_n + c_out * out_stride_c + l_out * out_stride_l] = sum;
+                    if (bias) sum += tensor_load_element(bias, c_out);
+                    tensor_store_element(out, n * out_stride_n + c_out * out_stride_c + l_out * out_stride_l, sum);
                 }
             }
         }
@@ -1170,6 +1475,12 @@ causa_tensor_t* causa_tensor_conv2d(
 ) {
     if (!input || !weight || input->dtype != weight->dtype) return NULL;
     if (input->ndim != 4 || weight->ndim != 4) return NULL;
+    // The groups divide the channels up, so a number of groups that is not
+    // a positive count would divide by zero. The same goes for the steps.
+    if (groups <= 0) return NULL;
+    if (!stride || !padding || !dilation) return NULL;
+    if (stride[0] <= 0 || stride[1] <= 0) return NULL;
+    if (dilation[0] <= 0 || dilation[1] <= 0) return NULL;
 
     int64_t N = input->shape[0];
     int64_t C_in = input->shape[1];
@@ -1193,25 +1504,25 @@ causa_tensor_t* causa_tensor_conv2d(
     causa_tensor_t* out = causa_tensor_new(input->arena, input->backend, out_shape, 4, &opts);
     if (!out) return NULL;
 
-    if (input->dtype == CAUSA_DTYPE_F32) {
-        const float* in = (const float*)input->data;
-        const float* w = (const float*)weight->data;
-        const float* b = bias ? (const float*)bias->data : NULL;
-        float* out_data = (float*)out->data;
+    {
+        // The strides are kept in bytes and the elements are counted, so
+        // the conversion is made here.
+        const int64_t esz = (int64_t)causa_dtype_size(input->dtype);
 
-        int64_t in_stride_n = input->strides[0] / (int64_t)sizeof(float);
-        int64_t in_stride_c = input->strides[1] / (int64_t)sizeof(float);
-        int64_t in_stride_h = input->strides[2] / (int64_t)sizeof(float);
-        int64_t in_stride_w = input->strides[3] / (int64_t)sizeof(float);
+        int64_t in_stride_n = input->strides[0] / esz;
+        int64_t in_stride_c = input->strides[1] / esz;
+        int64_t in_stride_h = input->strides[2] / esz;
+        int64_t in_stride_w = input->strides[3] / esz;
 
-        int64_t w_stride_c = weight->strides[1] / (int64_t)sizeof(float);
-        int64_t w_stride_h = weight->strides[2] / (int64_t)sizeof(float);
-        int64_t w_stride_w = weight->strides[3] / (int64_t)sizeof(float);
+        int64_t w_stride_o = weight->strides[0] / esz;
+        int64_t w_stride_c = weight->strides[1] / esz;
+        int64_t w_stride_h = weight->strides[2] / esz;
+        int64_t w_stride_w = weight->strides[3] / esz;
 
-        int64_t out_stride_n = out->strides[0] / (int64_t)sizeof(float);
-        int64_t out_stride_c = out->strides[1] / (int64_t)sizeof(float);
-        int64_t out_stride_h = out->strides[2] / (int64_t)sizeof(float);
-        int64_t out_stride_w = out->strides[3] / (int64_t)sizeof(float);
+        int64_t out_stride_n = out->strides[0] / esz;
+        int64_t out_stride_c = out->strides[1] / esz;
+        int64_t out_stride_h = out->strides[2] / esz;
+        int64_t out_stride_w = out->strides[3] / esz;
 
         for (int64_t n = 0; n < N; n++) {
             for (int64_t c_out = 0; c_out < C_out; c_out++) {
@@ -1231,16 +1542,16 @@ causa_tensor_t* causa_tensor_conv2d(
                                     int64_t h_in = h_in_start + kh * dilation[0];
                                     int64_t w_in = w_in_start + kw * dilation[1];
                                     if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
-                                        float in_val = in[n * in_stride_n + c_in * in_stride_c + h_in * in_stride_h + w_in * in_stride_w];
-                                        float w_val = w[c_out * (weight->strides[0] / (int64_t)sizeof(float)) + (c_in - c_in_start) * w_stride_c + kh * w_stride_h + kw * w_stride_w];
+                                        float in_val = tensor_load_element(input, n * in_stride_n + c_in * in_stride_c + h_in * in_stride_h + w_in * in_stride_w);
+                                        float w_val = tensor_load_element(weight, c_out * w_stride_o + (c_in - c_in_start) * w_stride_c + kh * w_stride_h + kw * w_stride_w);
                                         sum += in_val * w_val;
                                     }
                                 }
                             }
                         }
 
-                        if (b) sum += b[c_out];
-                        out_data[n * out_stride_n + c_out * out_stride_c + h_out * out_stride_h + w_out * out_stride_w] = sum;
+                        if (bias) sum += tensor_load_element(bias, c_out);
+                        tensor_store_element(out, n * out_stride_n + c_out * out_stride_c + h_out * out_stride_h + w_out * out_stride_w, sum);
                     }
                 }
             }
@@ -1352,6 +1663,27 @@ static int64_t broadcast_view_write(const broadcast_view_t* v, const int64_t* id
         if (t_dim < 0) continue;
         if (v->t->shape[t_dim] == 1) continue;
         off += idx[p] * v->own_strides[p];
+    }
+    return off;
+}
+
+// The position of the element at the broadcast place, counted in the
+// tensor's own order.
+//
+// The gradient buffers are laid out in order, whatever the layout of the
+// tensor they belong to. A kernel that collects into a gradient therefore
+// has to use this and not the offset of the element in the tensor: for a
+// view the two are different, and the offset of the view can point past
+// the end of the buffer.
+static int64_t broadcast_view_logical(const broadcast_view_t* v, const int64_t* idx) {
+    int64_t off = 0;
+    int64_t stride = 1;
+    for (int32_t p = 0; p < v->out_ndim; p++) {
+        int32_t t_dim = v->t->ndim - 1 - p;
+        if (t_dim < 0) continue;
+        if (v->t->shape[t_dim] == 1) continue;
+        off += idx[p] * stride;
+        stride *= v->t->shape[t_dim];
     }
     return off;
 }
@@ -1559,16 +1891,6 @@ static void accum_grad(causa_tensor_t* tensor, const causa_tensor_t* grad) {
     }
 }
 
-static void accum_grad_scalar(causa_tensor_t* tensor, float grad) {
-    if (!tensor->requires_grad) return;
-    ensure_grad(tensor);
-    if (!tensor->grad) return;
-    int64_t n = causa_tensor_numel(tensor);
-    for (int64_t i = 0; i < n; i++) {
-        causa_tensor_store_f32(tensor->grad, i, causa_tensor_load_f32(tensor->grad, i) + grad);
-    }
-}
-
 void causa_tensor_accumulate_grad(causa_tensor_t* t, const causa_tensor_t* grad) {
     if (!t || !grad) return;
     ensure_grad(t);
@@ -1584,14 +1906,59 @@ void causa_tensor_transpose_backward(
 ) {
     if (!a || !grad_output) return;
 
-    // The gradient w.r.t. the input is the output gradient with the two
-    // transposed dimensions swapped back.
+    int32_t ndim = a->ndim;
+    if (dim0 < 0 || dim1 < 0 || dim0 >= ndim || dim1 >= ndim) return;
+    if (grad_output->ndim != ndim) return;
+    if (!a->requires_grad) return;
+
+    ensure_grad(a);
+    if (!a->grad) return;
+
+    // The gradient of a transpose is the transpose of the gradient.
     //
-    // The transpose gives a view over the same buffer, so the gradient is
-    // not modified by it and the pointer does not have to be mutable.
-    causa_tensor_t* t = causa_tensor_transpose((causa_tensor_t*)grad_output, dim0, dim1);
-    if (!t) return;
-    causa_tensor_accumulate_grad(a, t);
+    // The transpose gives a view over the same buffer, and a view is not
+    // laid out in order, so the gradient cannot simply be copied over: the
+    // values would be read from the wrong places. Each value is put in the
+    // place the transpose sends it to instead.
+    //
+    // The gradient buffer is laid out in order, whatever the layout of the
+    // tensor it belongs to, so the place comes from the shape.
+    const int64_t g_elem = (int64_t)causa_dtype_size(grad_output->dtype);
+
+    int64_t out_index[CAUSA_MAX_DIMS];
+    for (int32_t i = 0; i < ndim; i++) out_index[i] = 0;
+
+    int64_t total = causa_tensor_numel(grad_output);
+
+    for (int64_t n = 0; n < total; n++) {
+        // Where the element is in the output.
+        int64_t g_offset = 0;
+        for (int32_t i = 0; i < ndim; i++) {
+            g_offset += out_index[i] * (grad_output->strides[i] / g_elem);
+        }
+
+        // Where it goes in the input: the two dimensions are swapped.
+        int64_t in_index[CAUSA_MAX_DIMS];
+        for (int32_t i = 0; i < ndim; i++) in_index[i] = out_index[i];
+        int64_t tmp = in_index[dim0];
+        in_index[dim0] = in_index[dim1];
+        in_index[dim1] = tmp;
+
+        int64_t a_offset = 0;
+        int64_t stride = 1;
+        for (int32_t i = ndim - 1; i >= 0; i--) {
+            a_offset += in_index[i] * stride;
+            stride *= a->shape[i];
+        }
+
+        causa_tensor_store_f32(a->grad, a_offset,
+            causa_tensor_load_f32(a->grad, a_offset) + causa_tensor_load_f32(grad_output, g_offset));
+
+        for (int32_t i = ndim - 1; i >= 0; i--) {
+            if (++out_index[i] < grad_output->shape[i]) break;
+            out_index[i] = 0;
+        }
+    }
 }
 
 causa_tensor_t* causa_tensor_diag(const causa_tensor_t* a) {
@@ -1636,21 +2003,22 @@ void causa_tensor_diag_backward(causa_tensor_t* a, const causa_tensor_t* grad_ou
     if (causa_tensor_numel(grad_output) != a->shape[0]) return;
 
     ensure_grad(a);
+    if (!a->grad) return;
 
     int64_t d = a->shape[0];
-    const size_t esz = causa_dtype_size(a->dtype);
-    int64_t stride0 = a->strides[0] / (int64_t)esz;
-    int64_t stride1 = a->strides[1] / (int64_t)esz;
 
-    if (a->dtype == CAUSA_DTYPE_F32) {
+    if (a->dtype == CAUSA_DTYPE_F32 && grad_output->dtype == CAUSA_DTYPE_F32) {
         float* dst = (float*)a->grad->data;
         const float* src = (const float*)grad_output->data;
         for (int64_t i = 0; i < d; i++) {
-            dst[i * stride0 + i * stride1] += src[i];
+            // The gradient is laid out in order, so the position of the
+            // diagonal element comes from the shape. The strides of the
+            // tensor would point into a larger buffer for a view.
+            dst[i * d + i] += src[i];
         }
     } else {
         for (int64_t i = 0; i < d; i++) {
-            int64_t at = i * stride0 + i * stride1;
+            int64_t at = i * d + i;
             causa_tensor_store_f32(a->grad, at, causa_tensor_load_f32(a->grad, at) + causa_tensor_load_f32(grad_output, i));
         }
     }
@@ -1676,17 +2044,12 @@ static void accum_broadcast_grad(
         g_strides[p] = grad->strides[grad_ndim - 1 - p] / (int64_t)esz;
     }
 
-    // Input strides, right-aligned; broadcast dimensions get a stride of zero
-    int64_t i_strides[CAUSA_MAX_DIMS];
+    // The shape of the input, right-aligned. A dimension the input does not
+    // have is broadcast over, and so is one whose extent is one.
+    int64_t i_shape[CAUSA_MAX_DIMS];
     for (int32_t p = 0; p < grad_ndim; p++) {
         int32_t in_dim = input->ndim - 1 - p;
-        if (in_dim < 0) {
-            i_strides[p] = 0;
-        } else if (input->shape[in_dim] == 1) {
-            i_strides[p] = 0;
-        } else {
-            i_strides[p] = input->strides[in_dim] / (int64_t)esz;
-        }
+        i_shape[p] = (in_dim < 0) ? 1 : input->shape[in_dim];
     }
 
     int64_t total = causa_tensor_numel(grad);
@@ -1698,10 +2061,26 @@ static void accum_broadcast_grad(
         const float* gg = (const float*)grad->data;
 
         for (int64_t n = 0; n < total; n++) {
-            int64_t g_off = 0, i_off = 0;
+            int64_t g_off = 0;
             for (int32_t p = 0; p < grad_ndim; p++) {
                 g_off += idx[p] * g_strides[p];
-                i_off += idx[p] * i_strides[p];
+            }
+
+            // The index of the input in its own dimensions. A dimension
+            // that is broadcast over always takes the same value.
+            int64_t in_idx[CAUSA_MAX_DIMS];
+            for (int32_t p = 0; p < grad_ndim; p++) {
+                in_idx[p] = (i_shape[p] == 1) ? 0 : idx[p];
+            }
+
+            // The gradient is laid out in order, so the position comes
+            // from the shape and not from the strides of the input.
+            int64_t i_off = 0;
+            int64_t stride = 1;
+            for (int32_t i = input->ndim - 1; i >= 0; i--) {
+                int32_t p = input->ndim - 1 - i;
+                i_off += in_idx[p] * stride;
+                stride *= input->shape[i];
             }
             gi[i_off] += gg[g_off];
 
@@ -1714,10 +2093,22 @@ static void accum_broadcast_grad(
     }
 
     for (int64_t n = 0; n < total; n++) {
-        int64_t g_off = 0, i_off = 0;
+        int64_t g_off = 0;
         for (int32_t p = 0; p < grad_ndim; p++) {
             g_off += idx[p] * g_strides[p];
-            i_off += idx[p] * i_strides[p];
+        }
+
+        int64_t in_idx[CAUSA_MAX_DIMS];
+        for (int32_t p = 0; p < grad_ndim; p++) {
+            in_idx[p] = (i_shape[p] == 1) ? 0 : idx[p];
+        }
+
+        int64_t i_off = 0;
+        int64_t stride = 1;
+        for (int32_t i = input->ndim - 1; i >= 0; i--) {
+            int32_t p = input->ndim - 1 - i;
+            i_off += in_idx[p] * stride;
+            stride *= input->shape[i];
         }
         causa_tensor_store_f32(input->grad, i_off, causa_tensor_load_f32(input->grad, i_off) + causa_tensor_load_f32(grad, g_off));
 
@@ -1793,8 +2184,12 @@ void causa_tensor_mul_backward(causa_tensor_t* a, causa_tensor_t* b, const causa
     for (int64_t n = 0; n < total; n++) {
         int64_t a_read = broadcast_view_read(&va, idx);
         int64_t b_read = broadcast_view_read(&vb, idx);
-        int64_t a_write = broadcast_view_write(&va, idx);
-        int64_t b_write = broadcast_view_write(&vb, idx);
+        // The contributions are collected in the order of the tensor, so
+        // the position of the element in that order is what is used. The
+        // offset in the layout of the tensor would point past the end of
+        // the buffer for a view.
+        int64_t a_write = broadcast_view_logical(&va, idx);
+        int64_t b_write = broadcast_view_logical(&vb, idx);
 
         float g = causa_tensor_load_f32(grad_output, n);
         a_acc[a_write] += g * causa_tensor_load_f32(b, b_read);
@@ -1854,8 +2249,12 @@ void causa_tensor_div_backward(causa_tensor_t* a, causa_tensor_t* b, const causa
     for (int64_t n = 0; n < total; n++) {
         int64_t a_read = broadcast_view_read(&va, idx);
         int64_t b_read = broadcast_view_read(&vb, idx);
-        int64_t a_write = broadcast_view_write(&va, idx);
-        int64_t b_write = broadcast_view_write(&vb, idx);
+        // The contributions are collected in the order of the tensor, so
+        // the position of the element in that order is what is used. The
+        // offset in the layout of the tensor would point past the end of
+        // the buffer for a view.
+        int64_t a_write = broadcast_view_logical(&va, idx);
+        int64_t b_write = broadcast_view_logical(&vb, idx);
 
         float g = causa_tensor_load_f32(grad_output, n);
         float bv = causa_tensor_load_f32(b, b_read);
@@ -2031,7 +2430,14 @@ void causa_tensor_pow_backward(causa_tensor_t* a, double exp, const causa_tensor
 
 void causa_tensor_activation_backward(causa_tensor_t* input, causa_activation_t act, double param, const causa_tensor_t* grad_output) {
     if (!grad_output || !input) return;
+
+    // The kernel below reads the elements as floats. A tensor of another
+    // element type would be read with the wrong width, so it is refused
+    // rather than read wrongly.
+    if (input->dtype != CAUSA_DTYPE_F32 || grad_output->dtype != CAUSA_DTYPE_F32) return;
+
     ensure_grad(input);
+    if (!input->grad) return;
 
     int64_t n = causa_tensor_numel(input);
     float* gi = (float*)input->grad->data;
@@ -2130,15 +2536,56 @@ void causa_tensor_activation_backward(causa_tensor_t* input, causa_activation_t 
 
 void causa_tensor_matmul_backward(causa_tensor_t* a, causa_tensor_t* b, const causa_tensor_t* grad_output) {
     if (!grad_output || !a || !b) return;
+    if (a->ndim < 2 || b->ndim < 2) return;
+    if (grad_output->ndim < 2) return;
 
-    if (a->ndim != 2 || b->ndim != 2) return;
+    // The kernel below reads the elements as floats. A tensor of another
+    // element type would be read with the wrong width, so it is refused
+    // rather than read wrongly.
+    if (a->dtype != CAUSA_DTYPE_F32 || b->dtype != CAUSA_DTYPE_F32 ||
+        grad_output->dtype != CAUSA_DTYPE_F32) return;
 
-    int64_t M = a->shape[0];
-    int64_t K = a->shape[1];
-    int64_t N = b->shape[1];
+    int64_t M = a->shape[a->ndim - 2];
+    int64_t K = a->shape[a->ndim - 1];
+    int64_t N = b->shape[b->ndim - 1];
+    if (b->shape[b->ndim - 2] != K) return;
 
-    if (K != b->shape[0]) return;
-    if (grad_output->shape[0] != M || grad_output->shape[1] != N) return;
+    int32_t a_batch = a->ndim - 2;
+    int32_t b_batch = b->ndim - 2;
+    int32_t out_batch = grad_output->ndim - 2;
+    if (grad_output->shape[out_batch] != M || grad_output->shape[out_batch + 1] != N) return;
+
+    const size_t esz = causa_dtype_size(a->dtype);
+
+    // The batch dimensions, right-aligned, with the extent and the stride of
+    // each. A dimension the operand does not have, or one whose extent is
+    // one, is broadcast over.
+    int64_t a_ext[CAUSA_MAX_DIMS], a_str[CAUSA_MAX_DIMS];
+    int64_t b_ext[CAUSA_MAX_DIMS], b_str[CAUSA_MAX_DIMS];
+    int64_t g_str[CAUSA_MAX_DIMS];
+    int64_t batch_shape[CAUSA_MAX_DIMS];
+    for (int32_t p = 0; p < out_batch; p++) {
+        int32_t da = a_batch - 1 - p;
+        int32_t db = b_batch - 1 - p;
+        a_ext[p] = (da >= 0) ? a->shape[da] : 1;
+        b_ext[p] = (db >= 0) ? b->shape[db] : 1;
+        g_str[p] = grad_output->strides[out_batch - 1 - p] / (int64_t)esz;
+        a_str[p] = (da >= 0) ? a->strides[da] / (int64_t)esz : 0;
+        b_str[p] = (db >= 0) ? b->strides[db] / (int64_t)esz : 0;
+        batch_shape[p] = grad_output->shape[out_batch - 1 - p];
+
+        // The extents have to agree with the output.
+        if (a_ext[p] != 1 && a_ext[p] != batch_shape[p]) return;
+        if (b_ext[p] != 1 && b_ext[p] != batch_shape[p]) return;
+    }
+
+    // The strides of the two dimensions the product is over.
+    int64_t lda = a->strides[a->ndim - 2] / (int64_t)esz;
+    int64_t lka = a->strides[a->ndim - 1] / (int64_t)esz;
+    int64_t lkb = b->strides[b->ndim - 2] / (int64_t)esz;
+    int64_t lnb = b->strides[b->ndim - 1] / (int64_t)esz;
+    int64_t lg0 = grad_output->strides[out_batch] / (int64_t)esz;
+    int64_t lg1 = grad_output->strides[out_batch + 1] / (int64_t)esz;
 
     const float* A = (const float*)a->data;
     const float* B = (const float*)b->data;
@@ -2146,39 +2593,90 @@ void causa_tensor_matmul_backward(causa_tensor_t* a, causa_tensor_t* b, const ca
 
     // Each side is handled separately: an operand that does not require
     // gradients has no gradient buffer, but the other operand still does.
+    float* GA = NULL;
     if (a->requires_grad) {
         ensure_grad(a);
-        if (a->grad) {
-            float* GA = (float*)a->grad->data;
+        if (a->grad) GA = (float*)a->grad->data;
+    }
+    float* GB = NULL;
+    if (b->requires_grad) {
+        ensure_grad(b);
+        if (b->grad) GB = (float*)b->grad->data;
+    }
+    if (!GA && !GB) return;
+
+    int64_t batch_total = 1;
+    for (int32_t p = 0; p < out_batch; p++) batch_total *= batch_shape[p];
+
+    int64_t bidx[CAUSA_MAX_DIMS];
+    for (int32_t p = 0; p < out_batch; p++) bidx[p] = 0;
+
+    for (int64_t bn = 0; bn < batch_total; bn++) {
+        // The place of this batch in each of the three tensors.
+        int64_t a_off = 0, b_off = 0, g_off = 0;
+        for (int32_t p = 0; p < out_batch; p++) {
+            int64_t ia = (a_ext[p] == 1) ? 0 : bidx[p];
+            int64_t ib = (b_ext[p] == 1) ? 0 : bidx[p];
+            a_off += ia * a_str[p];
+            b_off += ib * b_str[p];
+            g_off += bidx[p] * g_str[p];
+        }
+
+        // The place of this batch in the gradients. The gradient buffers are
+        // laid out in order, so the place comes from the shape.
+        int64_t a_grad_off = 0, b_grad_off = 0;
+        if (GA) {
+            int64_t stride = 1;
+            for (int32_t i = a->ndim - 1; i >= 0; i--) {
+                int32_t p = a_batch - 1 - i;
+                int64_t ia = (p >= 0 && a_ext[p] == 1) ? 0 : (p >= 0 ? bidx[p] : 0);
+                a_grad_off += ia * stride;
+                stride *= a->shape[i];
+            }
+        }
+        if (GB) {
+            int64_t stride = 1;
+            for (int32_t i = b->ndim - 1; i >= 0; i--) {
+                int32_t p = b_batch - 1 - i;
+                int64_t ib = (p >= 0 && b_ext[p] == 1) ? 0 : (p >= 0 ? bidx[p] : 0);
+                b_grad_off += ib * stride;
+                stride *= b->shape[i];
+            }
+        }
+
+        if (GA) {
             // dA = GO * B^T
             for (int64_t i = 0; i < M; i++) {
                 for (int64_t k = 0; k < K; k++) {
                     float sum = 0;
                     for (int64_t j = 0; j < N; j++) {
-                        sum += GO[i * N + j] * B[k * N + j];
+                        sum += GO[g_off + i * lg0 + j * lg1] * B[b_off + k * lkb + j * lnb];
                     }
-                    GA[i * K + k] += sum;
+                    GA[a_grad_off + i * K + k] += sum;
                 }
             }
         }
-    }
 
-    if (b->requires_grad) {
-        ensure_grad(b);
-        if (b->grad) {
-            float* GB = (float*)b->grad->data;
+        if (GB) {
             // dB = A^T * GO
             for (int64_t k = 0; k < K; k++) {
                 for (int64_t j = 0; j < N; j++) {
                     float sum = 0;
                     for (int64_t i = 0; i < M; i++) {
-                        sum += A[i * K + k] * GO[i * N + j];
+                        sum += A[a_off + i * lda + k * lka] * GO[g_off + i * lg0 + j * lg1];
                     }
-                    GB[k * N + j] += sum;
+                    GB[b_grad_off + k * N + j] += sum;
                 }
             }
         }
+
+        // On to the next batch
+        for (int32_t p = 0; p < out_batch; p++) {
+            if (++bidx[p] < batch_shape[p]) break;
+            bidx[p] = 0;
+        }
     }
 }
+
 
 

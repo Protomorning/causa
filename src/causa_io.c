@@ -247,6 +247,71 @@ static bool write_tensor_record(causa_writer_t* w, const causa_tensor_t* t) {
     return true;
 }
 
+// The number of bytes the context of an operation has to hold.
+//
+// An operation reads its context without checking how much of it there is,
+// so a file that gives less than the operation reads would make the
+// operation read past the end of its allocation.
+static size_t op_ctx_size_required(causa_op_type_t type) {
+    switch (type) {
+        case CAUSA_OP_POW:        return sizeof(double);
+        case CAUSA_OP_ACTIVATION: return sizeof(causa_activation_t) + sizeof(double);
+        case CAUSA_OP_REDUCE:     return sizeof(causa_reduce_ctx_t);
+        case CAUSA_OP_TRANSPOSE:  return 2 * sizeof(int32_t);
+        default:                  return 0;
+    }
+}
+
+// Check that the strides of a tensor that came from a file can be trusted.
+//
+// The strides say where each element sits in the buffer. A file that claims
+// a stride of a billion would make every kernel that follows the strides
+// read outside the buffer, so such a file is refused rather than believed.
+//
+// The rules are:
+//
+//   - every stride is a whole number of elements, because the kernels
+//     divide the stride by the element size to get to an element;
+//   - every element the shape can reach lies inside the buffer.
+//
+// A view of a larger buffer breaks the second rule, because the view only
+// knows its own elements and not the buffer it sits in. Such a file is
+// refused: the loader cannot rebuild it faithfully, and a tensor that looks
+// right and is not is worse than one that is refused.
+static bool tensor_strides_are_sane(
+    const int64_t* shape,
+    int32_t ndim,
+    const int64_t* strides,
+    size_t elem_size,
+    size_t nbytes
+) {
+    if (ndim <= 0) return true;
+
+    int64_t low = 0;
+    int64_t high = 0;
+
+    for (int32_t i = 0; i < ndim; i++) {
+        int64_t stride = strides[i];
+
+        // The stride has to be a whole number of elements.
+        if (stride % (int64_t)elem_size != 0) return false;
+
+        // The distance the last element of this dimension sits at has to be
+        // worked out without overflowing.
+        int64_t span = (shape[i] > 0) ? (shape[i] - 1) : 0;
+        if (stride == INT64_MIN) return false;
+        int64_t magnitude = (stride < 0) ? -stride : stride;
+        if (magnitude != 0 && span > INT64_MAX / magnitude) return false;
+
+        int64_t reach = span * stride;
+        if (reach < 0) low += reach; else high += reach;
+    }
+
+    if (low < 0) return false;
+    if (high < 0 || (uint64_t)high >= (uint64_t)nbytes) return false;
+    return true;
+}
+
 static bool read_tensor_record(causa_reader_t* r, causa_tensor_t** out, causa_arena_t* arena, causa_backend_t* backend) {
     uint32_t dtype, device, layout;
     int64_t ndim;
@@ -285,6 +350,19 @@ static bool read_tensor_record(causa_reader_t* r, causa_tensor_t** out, causa_ar
     uint64_t nbytes;
     if (!r_u64(r, &nbytes)) return false;
 
+    // The count of elements decides how much memory is set aside, so it is
+    // checked against a bound before anything is allocated. A shape that
+    // multiplies out to more than the bound would ask for more memory than
+    // the file could ever hold.
+    int64_t numel = 1;
+    for (int32_t i = 0; i < ndim; i++) {
+        if (shape[i] != 0 && numel > CAUSA_IO_MAX_ELEMENTS / shape[i]) {
+            reader_fail(r, "the tensor has more elements than the format allows");
+            return false;
+        }
+        numel *= shape[i];
+    }
+
     causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
     opts.dtype = (causa_dtype_t)dtype;
     opts.device = (causa_device_type_t)device;
@@ -292,15 +370,17 @@ static bool read_tensor_record(causa_reader_t* r, causa_tensor_t** out, causa_ar
     opts.requires_grad = requires_grad;
     opts.name = name;
 
+    // An element type that does not exist has no size, so the tensor cannot
+    // be built. The file is refused rather than read into nothing.
+    if (opts.dtype < 0 || opts.dtype >= CAUSA_DTYPE_COUNT) {
+        reader_fail(r, "unknown element type");
+        return false;
+    }
+
     causa_tensor_t* t = causa_tensor_new(arena, backend, shape, (int32_t)ndim, &opts);
     if (!t) {
         reader_fail(r, "tensor allocation failed");
         return false;
-    }
-
-    // Restore strides exactly (views may have non-contiguous layout)
-    for (int32_t i = 0; i < ndim; i++) {
-        t->strides[i] = strides[i];
     }
 
     // The file says how many bytes the data is. It has to be what the
@@ -309,6 +389,20 @@ static bool read_tensor_record(causa_reader_t* r, causa_tensor_t** out, causa_ar
     if (nbytes != (uint64_t)expected) {
         reader_fail(r, "the tensor size in the file does not match its shape");
         return false;
+    }
+
+    // The strides say where each element sits. They are only restored when
+    // they can be trusted, because a kernel that follows them reads the
+    // buffer wherever they point.
+    if (!tensor_strides_are_sane(shape, (int32_t)ndim, strides,
+                                 causa_dtype_size(opts.dtype), expected)) {
+        reader_fail(r, "the strides in the file do not match its shape");
+        return false;
+    }
+
+    // Restore strides exactly (views may have non-contiguous layout)
+    for (int32_t i = 0; i < ndim; i++) {
+        t->strides[i] = strides[i];
     }
 
     if (!r_bytes(r, t->data, (size_t)nbytes)) return false;
@@ -686,6 +780,10 @@ causa_tensor_t* causa_read_tensor(
         return NULL;
     }
     if (!r_u32(reader, &count)) return NULL;
+    if (count > CAUSA_IO_MAX_ITEMS) {
+        reader_fail(reader, "too many tensors in the file");
+        return NULL;
+    }
 
     causa_tensor_t* out = NULL;
     for (uint32_t i = 0; i < count; i++) {
@@ -786,6 +884,14 @@ static bool read_graph_ops(
         if (ctx_size > 0) {
             if (ctx_size > CAUSA_IO_MAX_ITEMS) {
                 reader_fail(reader, "the context of an operation is too large");
+                return false;
+            }
+            // The operation reads its context without checking how much of
+            // it there is, so the file has to give at least as much as the
+            // operation reads.
+            size_t required = op_ctx_size_required((causa_op_type_t)op_type);
+            if ((size_t)ctx_size < required) {
+                reader_fail(reader, "the context of an operation is too small for it");
                 return false;
             }
             ctx = causa_arena_alloc(arena, ctx_size, 8);

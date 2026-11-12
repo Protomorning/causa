@@ -153,8 +153,8 @@ the gradient back onto the diagonal.
 ### Optimizer
 
 Adam, with the learning rate, the sparsity weight `alpha`, and the iteration
-count all configurable. `W` is updated in place, so the graph is built once and
-reused across iterations.
+count all configurable through `causa_config_t`. `W` is updated in place, so the
+graph is built once and reused across iterations.
 
 The diagonal of `W` is held at zero after every step. A variable cannot be its
 own cause, and leaving the diagonal free would let the fit explain a variable
@@ -271,11 +271,14 @@ discovery result, which is useful when the structure was learned elsewhere.
 
 ### Counterfactuals in memory
 
-`causa_memory_store_counterfactual` places a counterfactual result into
-episodic memory, where it can later be retrieved by
-`causa_memory_retrieve_counterfactuals`. This is how "what would have
-happened if I had done the other thing" becomes part of the system's
-experience rather than something recomputed each time.
+`causa_memory_store_counterfactual` places a counterfactual result into the
+memory's own list of counterfactuals, which has room for as many as the
+episodic level has slots, and where it can later be retrieved by
+`causa_memory_retrieve_counterfactuals`. It is kept apart from the episodes
+on purpose: an episode is something that happened, and a counterfactual is
+something that could have happened, so the two are not mixed. This is how
+"what would have happened if I had done the other thing" becomes part of the
+system's experience rather than something recomputed each time.
 
 ## Reasoning over memory
 
@@ -379,8 +382,11 @@ The plan is worked out in three steps:
    known rather than read off the state.
 2. How far it has to move. That is the wanted value minus where it stands.
 3. What moves it. The law of the goal variable says which variables cause it
-   and how much, so the change needed on a parent is the change needed on the
-   goal, divided by the coefficient of that parent.
+   and how much. The change that has to be made on the causes is worked out
+   by solving the system the laws describe: the change on the goal, the
+   change on each cause and the size of its effect on the goal are three
+   sides of the same triangle, and the system is solved with a small ridge
+   term so that it stays solvable when the causes cannot be pinned down.
 
 The strongest cause is the one that is acted on, because it moves the goal the
 most for the least change. A goal variable with no law is exogenous, so it is

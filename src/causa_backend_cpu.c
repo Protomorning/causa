@@ -1,10 +1,26 @@
 #include "causa_backend.h"
 #include "causa_tensor.h"
 #include "causa_arena.h"
+#include "causa_platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <immintrin.h>
+
+// The vector unit is used when the compiler was told the machine has it.
+//
+// The compiler is the only one that knows: it is told with -mavx2 on the
+// platforms that need telling, and it defines the macro to match.
+//
+// The 128-bit unit is used when the 256-bit one is not available. It is
+// part of the x86-64 instruction set, so it needs no flag and it runs on
+// every machine the library runs on.
+#if defined(CAUSA_HAS_AVX2)
+    #include <immintrin.h>
+    #define CAUSA_VECTOR_WIDTH 8
+#elif defined(CAUSA_HAS_SSE)
+    #include <emmintrin.h>
+    #define CAUSA_VECTOR_WIDTH 4
+#endif
 
 typedef struct {
     int dummy;
@@ -58,14 +74,27 @@ static void cpu_backend_copy_tensor(causa_backend_t* backend, causa_tensor_t* ds
     causa_tensor_copy(dst, src);
 }
 
-static void add_f32_avx(const float* a, const float* b, float* out, int64_t n) {
+// Add two vectors of floats.
+//
+// The vector unit does it several at a time when the machine has it, and
+// the loop does it one at a time when it does not.
+static void add_f32(const float* a, const float* b, float* out, int64_t n) {
     int64_t i = 0;
+#if defined(CAUSA_HAS_AVX2)
     for (; i + 7 < n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
         __m256 vr = _mm256_add_ps(va, vb);
         _mm256_storeu_ps(out + i, vr);
     }
+#elif defined(CAUSA_HAS_SSE)
+    for (; i + 3 < n; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 vr = _mm_add_ps(va, vb);
+        _mm_storeu_ps(out + i, vr);
+    }
+#endif
     for (; i < n; i++) out[i] = a[i] + b[i];
 }
 
@@ -73,6 +102,14 @@ static causa_tensor_t* cpu_backend_add(causa_backend_t* backend, const causa_ten
     (void)backend;
     if (!a || !b || a->dtype != b->dtype || causa_tensor_numel(a) != causa_tensor_numel(b)) return NULL;
 
+    // The vector path walks the two buffers as flat arrays, so it is only
+    // right when both tensors are laid out in order. A tensor that is not
+    // goes through the general implementation, which follows the strides.
+    if (a->dtype != CAUSA_DTYPE_F32 ||
+        !causa_tensor_is_contiguous(a) || !causa_tensor_is_contiguous(b)) {
+        return causa_tensor_add(a, b);
+    }
+
     causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
     opts.dtype = a->dtype;
     opts.device = a->device;
@@ -82,23 +119,28 @@ static causa_tensor_t* cpu_backend_add(causa_backend_t* backend, const causa_ten
     if (!out) return NULL;
 
     int64_t n = causa_tensor_numel(a);
-    if (a->dtype == CAUSA_DTYPE_F32) {
-        add_f32_avx((const float*)a->data, (const float*)b->data, (float*)out->data, n);
-    } else {
-        causa_tensor_t* tmp = causa_tensor_add(a, b);
-        if (tmp) causa_tensor_copy(out, tmp);
-    }
+    add_f32((const float*)a->data, (const float*)b->data, (float*)out->data, n);
     return out;
 }
 
-static void mul_f32_avx(const float* a, const float* b, float* out, int64_t n) {
+
+static void mul_f32(const float* a, const float* b, float* out, int64_t n) {
     int64_t i = 0;
+#if defined(CAUSA_HAS_AVX2)
     for (; i + 7 < n; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
         __m256 vr = _mm256_mul_ps(va, vb);
         _mm256_storeu_ps(out + i, vr);
     }
+#elif defined(CAUSA_HAS_SSE)
+    for (; i + 3 < n; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        __m128 vr = _mm_mul_ps(va, vb);
+        _mm_storeu_ps(out + i, vr);
+    }
+#endif
     for (; i < n; i++) out[i] = a[i] * b[i];
 }
 
@@ -106,6 +148,14 @@ static causa_tensor_t* cpu_backend_mul(causa_backend_t* backend, const causa_ten
     (void)backend;
     if (!a || !b || a->dtype != b->dtype || causa_tensor_numel(a) != causa_tensor_numel(b)) return NULL;
 
+    // The vector path walks the two buffers as flat arrays, so it is only
+    // right when both tensors are laid out in order. A tensor that is not
+    // goes through the general implementation, which follows the strides.
+    if (a->dtype != CAUSA_DTYPE_F32 ||
+        !causa_tensor_is_contiguous(a) || !causa_tensor_is_contiguous(b)) {
+        return causa_tensor_mul(a, b);
+    }
+
     causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
     opts.dtype = a->dtype;
     opts.device = a->device;
@@ -115,14 +165,10 @@ static causa_tensor_t* cpu_backend_mul(causa_backend_t* backend, const causa_ten
     if (!out) return NULL;
 
     int64_t n = causa_tensor_numel(a);
-    if (a->dtype == CAUSA_DTYPE_F32) {
-        mul_f32_avx((const float*)a->data, (const float*)b->data, (float*)out->data, n);
-    } else {
-        causa_tensor_t* tmp = causa_tensor_mul(a, b);
-        if (tmp) causa_tensor_copy(out, tmp);
-    }
+    mul_f32((const float*)a->data, (const float*)b->data, (float*)out->data, n);
     return out;
 }
+
 
 static causa_tensor_t* cpu_backend_matmul(causa_backend_t* backend, const causa_tensor_t* a, const causa_tensor_t* b) {
     (void)backend;
@@ -160,18 +206,22 @@ static causa_tensor_t* cpu_backend_matmul(causa_backend_t* backend, const causa_
         const float* B = (const float*)b->data;
         float* C = (float*)out->data;
 
-        int64_t stride_a_batch = (a->ndim > 2) ? a->strides[a->ndim - 3] : 0;
-        int64_t stride_b_batch = (b->ndim > 2) ? b->strides[b->ndim - 3] : 0;
-        int64_t stride_out_batch = (out_ndim > 2) ? out->strides[out_ndim - 3] : 0;
+        // The strides are kept in bytes, and the loops index in elements,
+        // so the conversion has to be made here. Leaving it out made the
+        // loops step four times too far and read outside the buffers.
+        const int64_t esz = (int64_t)sizeof(float);
+        int64_t stride_a_batch = (a->ndim > 2) ? a->strides[a->ndim - 3] / esz : 0;
+        int64_t stride_b_batch = (b->ndim > 2) ? b->strides[b->ndim - 3] / esz : 0;
+        int64_t stride_out_batch = (out_ndim > 2) ? out->strides[out_ndim - 3] / esz : 0;
 
         for (int64_t batch_idx = 0; batch_idx < batch; batch_idx++) {
             const float* a_ptr = A + batch_idx * stride_a_batch;
             const float* b_ptr = B + batch_idx * stride_b_batch;
             float* c_ptr = C + batch_idx * stride_out_batch;
 
-            int64_t lda = a->strides[a->ndim - 2];
-            int64_t ldb = b->strides[b->ndim - 2];
-            int64_t ldc = out->strides[out_ndim - 2];
+            int64_t lda = a->strides[a->ndim - 2] / esz;
+            int64_t ldb = b->strides[b->ndim - 2] / esz;
+            int64_t ldc = out->strides[out_ndim - 2] / esz;
 
             for (int64_t i = 0; i < M; i++) {
                 for (int64_t j = 0; j < N; j++) {
@@ -183,10 +233,15 @@ static causa_tensor_t* cpu_backend_matmul(causa_backend_t* backend, const causa_
                 }
             }
         }
+    } else {
+        // Any other element type goes through the general implementation,
+        // which reads and writes through the helpers that know the type.
+        return causa_tensor_matmul(a, b);
     }
 
     return out;
 }
+
 
 static causa_tensor_t* cpu_backend_activation(causa_backend_t* backend, const causa_tensor_t* input, causa_activation_t act, double param) {
     (void)backend;

@@ -15,6 +15,19 @@ typedef struct {
 
 static causa_module_t g_module;
 
+// Make a Python object of the given type with nothing in it.
+//
+// PyObject_New hands out memory that is not cleared, so the fields would
+// hold whatever was there before. An object that is given up before its
+// fields are set would then release pointers that are not pointers.
+static void* py_object_new_zeroed(PyTypeObject* type, size_t size) {
+    void* obj = PyObject_New(PyObject, type);
+    // The head of the object holds the reference count and the type, and
+    // the allocator has already set them. Only the rest is cleared.
+    if (obj) memset((char*)obj + sizeof(PyObject), 0, size - sizeof(PyObject));
+    return obj;
+}
+
 // Capsule helpers for passing raw pointers through Python
 static const char* ARENA_CAPSULE = "causa.arena";
 static const char* BACKEND_CAPSULE = "causa.backend";
@@ -179,6 +192,14 @@ static int tape_append_scalar(
     return idx;
 }
 
+// Clear the marks that say which entries a pass reached.
+//
+// The marks are only for one pass. Without clearing them the next backward
+// pass would find everything already reached and would do nothing.
+static void tape_clear_reached(void) {
+    for (int i = 0; i < g_tape_count; i++) g_tape[i].reached = false;
+}
+
 // Release all tape entries (called at interpreter shutdown or on demand)
 static void tape_clear(void) {
     for (int i = 0; i < g_tape_count; i++) {
@@ -208,7 +229,7 @@ static PyObject* causa_new_internal(
     PyObject* arena_cap,
     PyObject* backend_cap
 ) {
-    PyTensorObject* self = PyObject_New(PyTensorObject, &PyTensor_Type);
+    PyTensorObject* self = (PyTensorObject*)py_object_new_zeroed(&PyTensor_Type, sizeof(PyTensorObject));
     if (!self) return NULL;
     self->tensor = t;
     self->arena = arena;
@@ -383,13 +404,25 @@ static PyGetSetDef causa_getset[] = {
 
 // --- data access ---
 
-// Build a nested Python list matching the tensor shape
-static PyObject* build_nested_list(const float* data, const int64_t* shape, int32_t ndim, int32_t dim) {
+// Build a nested Python list matching the tensor shape.
+//
+// The elements are read through the tensor, so the element type is the one
+// the tensor holds and not always float32. A tensor of one byte would be
+// read with the wrong width otherwise.
+static PyObject* build_nested_list(const causa_tensor_t* t, int64_t offset, int32_t dim) {
+    const int64_t* shape = t->shape;
+    int32_t ndim = t->ndim;
+
+    // A tensor with no dimensions holds one element.
+    if (ndim <= 0) {
+        return PyFloat_FromDouble((double)causa_tensor_load_f32(t, offset));
+    }
+
     if (dim == ndim - 1) {
         PyObject* list = PyList_New(shape[dim]);
         if (!list) return NULL;
         for (int64_t i = 0; i < shape[dim]; i++) {
-            PyObject* v = PyFloat_FromDouble((double)data[i]);
+            PyObject* v = PyFloat_FromDouble((double)causa_tensor_load_f32(t, offset + i));
             if (!v) { Py_DECREF(list); return NULL; }
             PyList_SET_ITEM(list, i, v);
         }
@@ -403,7 +436,7 @@ static PyObject* build_nested_list(const float* data, const int64_t* shape, int3
     for (int32_t i = dim + 1; i < ndim; i++) stride *= shape[i];
 
     for (int64_t i = 0; i < shape[dim]; i++) {
-        PyObject* sub = build_nested_list(data + i * stride, shape, ndim, dim + 1);
+        PyObject* sub = build_nested_list(t, offset + i * stride, dim + 1);
         if (!sub) { Py_DECREF(list); return NULL; }
         PyList_SET_ITEM(list, i, sub);
     }
@@ -414,8 +447,7 @@ static PyObject* causa_to_list(PyTensorObject* self, void* closure) {
     (void)closure;
     if (!self->tensor) Py_RETURN_NONE;
 
-    const float* data = (const float*)self->tensor->data;
-    return build_nested_list(data, self->tensor->shape, self->tensor->ndim, 0);
+    return build_nested_list(self->tensor, 0, 0);
 }
 
 // --- operators ---
@@ -427,7 +459,6 @@ static PyObject* causa_getitem(PyTensorObject* self, PyObject* key) {
     }
 
     int64_t n = causa_tensor_numel(self->tensor);
-    const float* data = (const float*)self->tensor->data;
 
     // Integer index
     if (PyIndex_Check(key)) {
@@ -438,7 +469,7 @@ static PyObject* causa_getitem(PyTensorObject* self, PyObject* key) {
             PyErr_SetString(PyExc_IndexError, "index out of range");
             return NULL;
         }
-        return PyFloat_FromDouble((double)data[idx]);
+        return PyFloat_FromDouble((double)causa_tensor_load_f32(self->tensor, idx));
     }
 
     // Slice
@@ -448,7 +479,7 @@ static PyObject* causa_getitem(PyTensorObject* self, PyObject* key) {
         PyObject* list = PyList_New(slicelen);
         if (!list) return NULL;
         for (Py_ssize_t i = 0; i < slicelen; i++) {
-            PyObject* v = PyFloat_FromDouble((double)data[start + i * step]);
+            PyObject* v = PyFloat_FromDouble((double)causa_tensor_load_f32(self->tensor, start + i * step));
             if (!v) { Py_DECREF(list); return NULL; }
             PyList_SET_ITEM(list, i, v);
         }
@@ -466,7 +497,6 @@ static int causa_setitem(PyTensorObject* self, PyObject* key, PyObject* value) {
     }
 
     int64_t n = causa_tensor_numel(self->tensor);
-    float* data = (float*)self->tensor->data;
 
     if (PyIndex_Check(key)) {
         Py_ssize_t idx = PyNumber_AsSsize_t(key, PyExc_IndexError);
@@ -478,7 +508,7 @@ static int causa_setitem(PyTensorObject* self, PyObject* key, PyObject* value) {
         }
         double v = PyFloat_AsDouble(value);
         if (v == -1.0 && PyErr_Occurred()) return -1;
-        data[idx] = (float)v;
+        causa_tensor_store_f32(self->tensor, idx, (float)v);
         return 0;
     }
 
@@ -497,7 +527,7 @@ static int causa_setitem(PyTensorObject* self, PyObject* key, PyObject* value) {
         for (Py_ssize_t i = 0; i < slicelen; i++) {
             double v = PyFloat_AsDouble(PySequence_Fast_GET_ITEM(seq, i));
             if (v == -1.0 && PyErr_Occurred()) { Py_DECREF(seq); return -1; }
-            data[start + i * step] = (float)v;
+            causa_tensor_store_f32(self->tensor, start + i * step, (float)v);
         }
         Py_DECREF(seq);
         return 0;
@@ -532,6 +562,13 @@ static PyObject* causa_binop(PyTensorObject* self, PyObject* other, binop_t op, 
 
     if (PyObject_TypeCheck(other, &PyTensor_Type)) {
         PyTensorObject* o = (PyTensorObject*)other;
+        // A tensor that has no data behind it is not an operand. The
+        // backward pass on a leaf hands one of these back, and using it
+        // would read through a pointer that is not there.
+        if (!o->tensor) {
+            PyErr_SetString(PyExc_ValueError, "invalid tensor");
+            return NULL;
+        }
         needs_grad = needs_grad || o->tensor->requires_grad;
 
         switch (op) {
@@ -777,7 +814,11 @@ static PyObject* causa_reshape(PyTensorObject* self, PyObject* args) {
     if (!out) return NULL;
     if (self->tensor->requires_grad) {
         PyObject* ins[1] = {(PyObject*)self};
-        int idx = tape_append(TAPE_RESHAPE, ins, 1, out, 0, 0, shape, (int32_t)n);
+        // The shape the input had is what is recorded. The backward pass
+        // puts the gradient back into that shape, and a gradient that was
+        // left in the shape the reshape produced would not fit the input.
+        int idx = tape_append(TAPE_RESHAPE, ins, 1, out, 0, 0,
+                              self->tensor->shape, self->tensor->ndim);
         if (idx >= 0) ((PyTensorObject*)out)->tape_idx = idx;
     }
     return out;
@@ -899,7 +940,13 @@ static PyObject* causa_backward(PyTensorObject* self, PyObject* args, PyObject* 
     } else {
         causa_tensor_t* g = causa_tensor_new(self->arena, self->backend,
                                                self->tensor->shape, self->tensor->ndim, &gopts);
-        if (!g) { PyErr_SetString(PyExc_RuntimeError, "failed to allocate gradient"); return NULL; }
+        if (!g) {
+            // The marks have to be cleared here as well, or the next pass
+            // would find the entries of this one already reached.
+            tape_clear_reached();
+            PyErr_SetString(PyExc_RuntimeError, "failed to allocate gradient");
+            return NULL;
+        }
         causa_tensor_copy(g, seed);
         self->tensor->grad = g;
     }
@@ -1025,15 +1072,25 @@ static PyObject* causa_backward(PyTensorObject* self, PyObject* args, PyObject* 
                 break;
             }
             case TAPE_TRANSPOSE: {
-                // Gradient w.r.t. input is the transpose of the output gradient
+                // The gradient with respect to the input is the output
+                // gradient turned the other way round.
+                //
+                // The transpose gives a view, and a view is not laid out in
+                // order, so the gradient cannot be copied in one go: the
+                // values would be read from the wrong places. The backward
+                // of the transpose follows the view instead.
                 causa_tensor_t* a = ((PyTensorObject*)e->inputs[0])->tensor;
-                causa_tensor_t* t = causa_tensor_transpose(grad, e->dim0, e->dim1);
-                if (!t) break;
-                causa_tensor_accumulate_grad(a, t);
+                causa_tensor_transpose_backward(a, grad, e->dim0, e->dim1);
                 break;
             }
             case TAPE_RESHAPE: {
-                // Gradient w.r.t. input is the output gradient reshaped back
+                // The gradient with respect to the input is the output
+                // gradient put back into the shape the input had.
+                //
+                // The shape the input had is the one that was recorded, and
+                // not the shape the reshape produced: a gradient that was
+                // left in the shape of the output would not fit the input
+                // it belongs to.
                 causa_tensor_t* a = ((PyTensorObject*)e->inputs[0])->tensor;
                 causa_tensor_t* r = causa_tensor_reshape(grad, e->out_shape, e->out_ndim);
                 if (!r) break;
@@ -1118,7 +1175,7 @@ static PyObject* causa_backward(PyTensorObject* self, PyObject* args, PyObject* 
 
     // The marks are only for this pass. Without clearing them the next
     // backward pass would find everything already reached and do nothing.
-    for (int i = 0; i < g_tape_count; i++) g_tape[i].reached = false;
+    tape_clear_reached();
 
     if (!root) {
         root = self;
@@ -1558,6 +1615,11 @@ typedef struct {
     PyObject* intervention_val;
     PyObject* evidence;
     PyObject* evidence_vars;
+    // The model the counterfactual was computed on. It is kept so that the
+    // model stays alive as long as the counterfactual does: the
+    // counterfactual holds a pointer to the copy of the model that the
+    // intervention made.
+    PyObject* scm_obj;
 } PyCounterfactualObject;
 
 typedef struct {
@@ -1697,8 +1759,19 @@ static int memory_init(PyMemoryObject* self, PyObject* args, PyObject* kwargs) {
         if (!fast) return -1;
         Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
         for (Py_ssize_t i = 0; i < n && i < CAUSA_MEMORY_MAX_LEVELS; i++) {
-            cfg.capacity[i] = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(fast, i));
+            long long c = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(fast, i));
             if (PyErr_Occurred()) { Py_DECREF(fast); return -1; }
+            // The capacity decides how much memory is set aside before
+            // anything is stored, so a number that is not a count of slots
+            // is refused here rather than later.
+            if (c < 0 || c > CAUSA_MEMORY_MAX_SLOTS) {
+                Py_DECREF(fast);
+                PyErr_Format(PyExc_ValueError,
+                             "the capacity of a level must be between 0 and %d",
+                             CAUSA_MEMORY_MAX_SLOTS);
+                return -1;
+            }
+            cfg.capacity[i] = (int64_t)c;
         }
         Py_DECREF(fast);
     }
@@ -1929,6 +2002,112 @@ static PyObject* memory_decay(PyMemoryObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+// Store a counterfactual: what would have happened, in a given situation.
+//
+// The query is the variable the question was about, the context is the
+// situation the question was asked in, and the result is what would have
+// happened.
+static PyObject* memory_store_counterfactual(PyMemoryObject* self, PyObject* args) {
+    PyObject* query_obj;
+    PyObject* context_obj;
+    PyObject* result_obj;
+    if (!PyArg_ParseTuple(args, "OOO", &query_obj, &context_obj, &result_obj)) return NULL;
+
+    if (!PyObject_TypeCheck(query_obj, &PyTensor_Type) ||
+        !PyObject_TypeCheck(context_obj, &PyTensor_Type) ||
+        !PyObject_TypeCheck(result_obj, &PyTensor_Type)) {
+        PyErr_SetString(PyExc_TypeError, "all three arguments must be tensors");
+        return NULL;
+    }
+
+    causa_tensor_t* query = ((PyTensorObject*)query_obj)->tensor;
+    const char* name = query->name[0] ? query->name : NULL;
+    if (!name) {
+        PyErr_SetString(PyExc_ValueError, "the query variable must have a name");
+        return NULL;
+    }
+
+    int32_t stored = causa_memory_keep_counterfactual(
+        self->memory,
+        name,
+        ((PyTensorObject*)context_obj)->tensor,
+        ((PyTensorObject*)result_obj)->tensor);
+
+    if (stored < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "the counterfactual could not be stored");
+        return NULL;
+    }
+    return PyLong_FromLong(stored);
+}
+
+// The counterfactuals about one variable, in the situations most like the
+// given one.
+//
+// The results are returned as a list.
+static PyObject* memory_find_counterfactuals(PyMemoryObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"query", "context", "k", NULL};
+    PyObject* query_obj;
+    PyObject* context_obj;
+    int k = 4;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|i", kwlist, &query_obj, &context_obj, &k)) {
+        return NULL;
+    }
+
+    if (!PyObject_TypeCheck(query_obj, &PyTensor_Type) ||
+        !PyObject_TypeCheck(context_obj, &PyTensor_Type)) {
+        PyErr_SetString(PyExc_TypeError, "the query and the context must be tensors");
+        return NULL;
+    }
+    if (k <= 0) {
+        PyErr_SetString(PyExc_ValueError, "the number of results must be positive");
+        return NULL;
+    }
+
+    causa_tensor_t* query = ((PyTensorObject*)query_obj)->tensor;
+    const char* name = query->name[0] ? query->name : NULL;
+    if (!name) {
+        PyErr_SetString(PyExc_ValueError, "the query variable must have a name");
+        return NULL;
+    }
+
+    int32_t max = k < 64 ? k : 64;
+    causa_tensor_t* results[64];
+    int32_t found = causa_memory_find_counterfactuals(
+        self->memory, name,
+        ((PyTensorObject*)context_obj)->tensor,
+        max, results);
+
+    if (found < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "the counterfactuals could not be found");
+        return NULL;
+    }
+
+    PyObject* list = PyList_New(found);
+    if (!list) return NULL;
+    for (int32_t i = 0; i < found; i++) {
+        PyObject* item = causa_new_internal(results[i], self->arena, self->backend,
+                                           self->arena_cap, self->backend_cap);
+        if (!item) { Py_DECREF(list); return NULL; }
+        PyList_SET_ITEM(list, i, item);
+    }
+    return list;
+}
+
+// Write the memory to a file.
+//
+// Every level and every occupied slot is written, so that a memory loaded
+// from the file holds what this one held.
+static PyObject* memory_save(PyMemoryObject* self, PyObject* args) {
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    if (!causa_save_memory(path, self->memory)) {
+        PyErr_SetString(PyExc_RuntimeError, "the memory could not be written");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 // Reason over the memory and fill in the variables that were not observed.
 //
 // The observation holds one value per variable, and a NaN marks a variable
@@ -1975,7 +2154,7 @@ static PyObject* memory_build_scm(PyMemoryObject* self, PyObject* args) {
     int num_variables;
     if (!PyArg_ParseTuple(args, "i", &num_variables)) return NULL;
 
-    PySCMObject* scm = PyObject_New(PySCMObject, &PySCM_Type);
+    PySCMObject* scm = (PySCMObject*)py_object_new_zeroed(&PySCM_Type, sizeof(PySCMObject));
     if (!scm) return NULL;
 
     causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
@@ -2183,6 +2362,9 @@ static PyMethodDef memory_methods[] = {
     {"find_procedures", (PyCFunction)memory_find_procedures, METH_VARARGS, "Find the procedures that apply to a state"},
     {"plan_intervention", (PyCFunction)memory_plan_intervention, METH_VARARGS, "Work out what to do to reach a goal"},
     {"decay", (PyCFunction)memory_decay, METH_VARARGS, "Age the memories by a time step"},
+    {"store_counterfactual", (PyCFunction)memory_store_counterfactual, METH_VARARGS, "Keep a counterfactual: what would have happened, in a given situation"},
+    {"find_counterfactuals", (PyCFunction)memory_find_counterfactuals, METH_VARARGS | METH_KEYWORDS, "The counterfactuals about one variable, in the situations most like the given one"},
+    {"save", (PyCFunction)memory_save, METH_VARARGS, "Write the memory to a file"},
     {NULL}
 };
 
@@ -2203,6 +2385,9 @@ static PyTypeObject PyMemory_Type = {
 // ============================================================
 
 static void scm_dealloc(PySCMObject* self) {
+    // The copy of the model that an intervention made has an arena of its
+    // own, and it is released here.
+    if (self->scm) causa_scm_free(self->scm);
     Py_XDECREF(self->arena_cap);
     Py_XDECREF(self->backend_cap);
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -2449,7 +2634,7 @@ static PyObject* scm_do(PySCMObject* self, PyObject* args) {
 
     // The intervened model is a model of its own, so it is handed back as
     // one. It shares the arena with the model it came from.
-    PySCMObject* result = PyObject_New(PySCMObject, &PySCM_Type);
+    PySCMObject* result = (PySCMObject*)py_object_new_zeroed(&PySCM_Type, sizeof(PySCMObject));
     if (!result) return NULL;
 
     result->scm = intervened;
@@ -2499,6 +2684,21 @@ static PyObject* scm_sample(PySCMObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+// Write the model to a file.
+//
+// The file holds the variables, the parents of each, the noise and the
+// operations of the graph, so that a model loaded from it can still be run.
+static PyObject* scm_save(PySCMObject* self, PyObject* args) {
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    if (!causa_save_scm(path, self->scm)) {
+        PyErr_SetString(PyExc_RuntimeError, "the model could not be written");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef scm_methods[] = {
     {"variable", (PyCFunction)scm_variable, METH_VARARGS | METH_KEYWORDS, "Create a variable in the model"},
     {"add_equation", (PyCFunction)scm_add_equation, METH_VARARGS | METH_KEYWORDS, "Add a structural equation"},
@@ -2507,6 +2707,7 @@ static PyMethodDef scm_methods[] = {
     {"do", (PyCFunction)scm_do, METH_VARARGS, "Apply an intervention"},
     {"evaluate", (PyCFunction)scm_evaluate, METH_VARARGS, "Run the model and report the value of every variable"},
     {"sample", (PyCFunction)scm_sample, METH_VARARGS, "Draw fresh noise and evaluate"},
+    {"save", (PyCFunction)scm_save, METH_VARARGS, "Write the model to a file"},
     {NULL}
 };
 
@@ -2617,6 +2818,7 @@ static void counterfactual_dealloc(PyCounterfactualObject* self) {
     Py_XDECREF(self->intervention_val);
     Py_XDECREF(self->evidence);
     Py_XDECREF(self->evidence_vars);
+    Py_XDECREF(self->scm_obj);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -2736,6 +2938,13 @@ static PyObject* counterfactual_compute(PyCounterfactualObject* self, PyObject* 
     causa_scm_t* scm = ((PySCMObject*)scm_obj)->scm;
     causa_counterfactual_compute(scm, self->cf);
 
+    // The model is kept, so that it stays alive as long as the
+    // counterfactual does. The counterfactual holds a pointer to the copy
+    // of the model that the intervention made.
+    Py_XDECREF(self->scm_obj);
+    self->scm_obj = scm_obj;
+    Py_INCREF(scm_obj);
+
     if (!self->cf->result) {
         PyErr_SetString(PyExc_RuntimeError, "the counterfactual produced no result");
         return NULL;
@@ -2752,6 +2961,29 @@ static PyObject* counterfactual_result(PyCounterfactualObject* self, void* closu
                                self->arena_cap, self->backend_cap);
 }
 
+// Keep the counterfactual in a memory, so that it can be found again.
+//
+// The counterfactual is stored with the situation it was asked in and with
+// the name of the variable it answers, so that a later question about the
+// same variable finds it.
+static PyObject* counterfactual_store_in(PyCounterfactualObject* self, PyObject* args) {
+    PyObject* mem_obj;
+    if (!PyArg_ParseTuple(args, "O", &mem_obj)) return NULL;
+
+    if (!PyObject_TypeCheck(mem_obj, &PyMemory_Type)) {
+        PyErr_SetString(PyExc_TypeError, "expected a Memory");
+        return NULL;
+    }
+
+    PyMemoryObject* mem = (PyMemoryObject*)mem_obj;
+    causa_tensor_t* stored = causa_memory_store_counterfactual(mem->memory, self->cf);
+    if (!stored) {
+        PyErr_SetString(PyExc_RuntimeError, "the counterfactual could not be stored");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyGetSetDef counterfactual_getset[] = {
     {"result", (getter)counterfactual_result, NULL, "The counterfactual outcome", NULL},
     {NULL}
@@ -2760,6 +2992,7 @@ static PyGetSetDef counterfactual_getset[] = {
 static PyMethodDef counterfactual_methods[] = {
     {"set_evidence", (PyCFunction)counterfactual_set_evidence, METH_VARARGS, "Give the observed value of every variable"},
     {"compute", (PyCFunction)counterfactual_compute, METH_VARARGS, "Run the counterfactual"},
+    {"store_in", (PyCFunction)counterfactual_store_in, METH_VARARGS, "Keep the counterfactual in a memory"},
     {NULL}
 };
 
@@ -2832,7 +3065,7 @@ static PyObject* py_discover(PyObject* self, PyObject* args, PyObject* kwargs) {
     }
     memcpy(copy, disc, sizeof(causa_discovery_t));
 
-    PyDiscoveryObject* result = PyObject_New(PyDiscoveryObject, &PyDiscovery_Type);
+    PyDiscoveryObject* result = (PyDiscoveryObject*)py_object_new_zeroed(&PyDiscovery_Type, sizeof(PyDiscoveryObject));
     if (!result) {
         causa_arena_free(arena);
         return NULL;
@@ -2848,6 +3081,78 @@ static PyMethodDef causal_methods[] = {
     {NULL}
 };
 
+// Load a model from a file.
+//
+// The model comes back with its graph, so that it can be run and
+// intervened on as soon as it is loaded.
+static PyObject* py_load_scm(PyObject* self, PyObject* args) {
+    (void)self;
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    PySCMObject* scm = (PySCMObject*)py_object_new_zeroed(&PySCM_Type, sizeof(PySCMObject));
+    if (!scm) return NULL;
+
+    causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    if (!arena || !backend) {
+        PyErr_SetString(PyExc_RuntimeError, "could not create the model");
+        Py_DECREF(scm);
+        return NULL;
+    }
+
+    scm->arena = arena;
+    scm->backend = backend;
+    scm->arena_cap = PyCapsule_New((void*)arena, ARENA_CAPSULE, arena_capsule_destructor);
+    scm->backend_cap = PyCapsule_New((void*)backend, BACKEND_CAPSULE, backend_capsule_destructor);
+    scm->graph = NULL;
+
+    scm->scm = causa_load_scm(path, arena, backend);
+    if (!scm->scm) {
+        PyErr_SetString(PyExc_RuntimeError, "the model could not be read");
+        Py_DECREF(scm);
+        return NULL;
+    }
+    scm->graph = scm->scm->base_graph;
+
+    return (PyObject*)scm;
+}
+
+// Load a memory from a file.
+//
+// The levels, the slots and the settings all come back, so that the memory
+// can be used and learned from as it was before.
+static PyObject* py_load_memory(PyObject* self, PyObject* args) {
+    (void)self;
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    PyMemoryObject* memory = (PyMemoryObject*)py_object_new_zeroed(&PyMemory_Type, sizeof(PyMemoryObject));
+    if (!memory) return NULL;
+
+    causa_arena_t* arena = causa_arena_new(16 * 1024 * 1024);
+    causa_backend_t* backend = causa_backend_cpu_new();
+    if (!arena || !backend) {
+        PyErr_SetString(PyExc_RuntimeError, "could not create the memory");
+        Py_DECREF(memory);
+        return NULL;
+    }
+
+    memory->arena = arena;
+    memory->backend = backend;
+    memory->arena_cap = PyCapsule_New((void*)arena, ARENA_CAPSULE, arena_capsule_destructor);
+    memory->backend_cap = PyCapsule_New((void*)backend, BACKEND_CAPSULE, backend_capsule_destructor);
+
+    memory->memory = causa_load_memory(path, arena, backend);
+    if (!memory->memory) {
+        PyErr_SetString(PyExc_RuntimeError, "the memory could not be read");
+        Py_DECREF(memory);
+        return NULL;
+    }
+
+    return (PyObject*)memory;
+}
+
 static PyMethodDef module_methods[] = {
     {"zeros", (PyCFunction)py_zeros, METH_VARARGS | METH_KEYWORDS, "Create a zero-filled tensor"},
     {"full", (PyCFunction)py_full, METH_VARARGS | METH_KEYWORDS, "Create a tensor filled with a value"},
@@ -2855,6 +3160,8 @@ static PyMethodDef module_methods[] = {
     {"tensor", (PyCFunction)py_tensor, METH_VARARGS | METH_KEYWORDS, "Create a tensor from Python data"},
     {"save", (PyCFunction)py_save, METH_VARARGS, "Save a tensor to disk"},
     {"load", (PyCFunction)py_load, METH_VARARGS, "Load a tensor from disk"},
+    {"load_scm", (PyCFunction)py_load_scm, METH_VARARGS, "Load a causal model from disk"},
+    {"load_memory", (PyCFunction)py_load_memory, METH_VARARGS, "Load a memory from disk"},
     {"version", (PyCFunction)py_version, METH_NOARGS, "Return the library version"},
     {"has_cuda", (PyCFunction)py_has_cuda, METH_NOARGS, "Return True if a CUDA device is available"},
     {"discover", (PyCFunction)py_discover, METH_VARARGS | METH_KEYWORDS, "Learn a causal structure from data"},

@@ -2,7 +2,7 @@
 #include "causa_arena.h"
 #include "causa_tensor.h"
 #include "causa_graph.h"
-#include "causa_backend.h"
+#include "causa_linalg.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -11,6 +11,9 @@
 struct causa_memory_slot_s {
     causa_tensor_t* key;
     causa_tensor_t* value;
+    // The weight the plasticity rule works on. It is kept apart from the
+    // key, because the key is what the memory is looked up by.
+    causa_tensor_t* weight;
     float timestamp;
     float strength;
     int32_t access_count;
@@ -29,24 +32,40 @@ struct causa_memory_s {
     int64_t num_slots[CAUSA_MEMORY_MAX_LEVELS];
     int64_t next_slot[CAUSA_MEMORY_MAX_LEVELS];
 
+    // The counterfactuals that were computed and kept.
+    //
+    // They are kept here rather than in a level, because a level holds what
+    // happened and a counterfactual holds what would have happened. Were
+    // they in the same place, the discovery would learn from things that
+    // never occurred.
+    causa_memory_counterfactual_t* counterfactuals;
+    int32_t num_counterfactuals;
+    int32_t capacity_counterfactuals;
+
     float global_time;
     float last_consolidation_time;
 
     causa_plasticity_rule_t* plasticity_rules[CAUSA_MEMORY_MAX_LEVELS];
-
-    causa_tensor_t* temp_key;
-    causa_tensor_t* temp_value;
-    causa_tensor_t* similarity_buffer;
 };
 
-static void memory_init_level(causa_memory_t* mem, causa_memory_level_t level) {
+static bool memory_init_level(causa_memory_t* mem, causa_memory_level_t level) {
     int64_t cap = mem->config.capacity[level];
-    mem->slots[level] = (causa_memory_slot_t**)causa_arena_alloc(mem->arena, sizeof(causa_memory_slot_t*) * cap, CAUSA_ALIGNOF(causa_memory_slot_t*));
+
+    // A capacity that is not a count of slots is refused. A negative one
+    // would ask for memory that cannot be asked for, and a very large one
+    // would ask for more than there is.
+    if (cap < 0 || cap > CAUSA_MEMORY_MAX_SLOTS) return false;
+
+    mem->slots[level] = (causa_memory_slot_t**)causa_arena_alloc(mem->arena, sizeof(causa_memory_slot_t*) * (cap ? cap : 1), CAUSA_ALIGNOF(causa_memory_slot_t*));
+    if (!mem->slots[level]) return false;
+
     for (int64_t i = 0; i < cap; i++) {
         mem->slots[level][i] = (causa_memory_slot_t*)causa_arena_alloc(mem->arena, sizeof(causa_memory_slot_t), CAUSA_ALIGNOF(causa_memory_slot_t));
+        if (!mem->slots[level][i]) return false;
         mem->slots[level][i]->occupied = false;
         mem->slots[level][i]->key = NULL;
         mem->slots[level][i]->value = NULL;
+        mem->slots[level][i]->weight = NULL;
         mem->slots[level][i]->timestamp = 0.0f;
         mem->slots[level][i]->strength = 0.0f;
         mem->slots[level][i]->access_count = 0;
@@ -54,6 +73,7 @@ static void memory_init_level(causa_memory_t* mem, causa_memory_level_t level) {
     }
     mem->num_slots[level] = cap;
     mem->next_slot[level] = 0;
+    return true;
 }
 
 causa_memory_t* causa_memory_new(
@@ -83,29 +103,27 @@ causa_memory_t* causa_memory_new(
     }
 
     for (int i = 0; i < CAUSA_MEMORY_MAX_LEVELS; i++) {
-        memory_init_level(mem, (causa_memory_level_t)i);
+        if (!memory_init_level(mem, (causa_memory_level_t)i)) {
+            return NULL;
+        }
     }
 
-    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
-    opts.dtype = CAUSA_DTYPE_F32;
-    opts.device = CAUSA_DEVICE_CPU;
-    opts.requires_grad = cfg.differentiable;
-
-    int64_t key_shape[] = {cfg.key_dim};
-    int64_t val_shape[] = {cfg.value_dim};
-
-    // The similarity buffer holds one score per occupied slot, so it has to
-    // be as large as the biggest level. Sizing it by the working level alone
-    // overflows it as soon as the episodic or semantic level is searched.
-    int64_t max_capacity = 1;
-    for (int i = 0; i < CAUSA_MEMORY_MAX_LEVELS; i++) {
-        if (cfg.capacity[i] > max_capacity) max_capacity = cfg.capacity[i];
+    // The counterfactuals are kept apart from the levels, because they are
+    // what would have happened rather than what did. They are given the room
+    // of the episodic level, which is where experience is kept.
+    mem->counterfactuals = NULL;
+    mem->capacity_counterfactuals = (int32_t)cfg.capacity[CAUSA_MEMORY_EPISODIC];
+    if (mem->capacity_counterfactuals > 0) {
+        mem->counterfactuals = (causa_memory_counterfactual_t*)causa_arena_alloc(
+            arena,
+            sizeof(causa_memory_counterfactual_t) * (size_t)mem->capacity_counterfactuals,
+            CAUSA_ALIGNOF(causa_memory_counterfactual_t));
+        if (!mem->counterfactuals) {
+            mem->capacity_counterfactuals = 0;
+            return NULL;
+        }
     }
-    int64_t sim_shape[] = {max_capacity};
-
-    mem->temp_key = causa_tensor_new(arena, backend, key_shape, 1, &opts);
-    mem->temp_value = causa_tensor_new(arena, backend, val_shape, 1, &opts);
-    mem->similarity_buffer = causa_tensor_new(arena, backend, sim_shape, 1, &opts);
+    mem->num_counterfactuals = 0;
 
     return mem;
 }
@@ -116,10 +134,16 @@ void causa_memory_free(causa_memory_t* mem) {
 
 static int64_t memory_find_slot(causa_memory_t* mem, causa_memory_level_t level, const causa_tensor_t* key) {
     if (!mem || level >= CAUSA_MEMORY_MAX_LEVELS) return -1;
+    if (!key) return -1;
 
     int64_t cap = mem->config.capacity[level];
-    float* key_data = (float*)key->data;
     int64_t key_dim = mem->config.key_dim;
+
+    // The key is read up to its width, so it has to be that wide. A key
+    // that is shorter would be read past its end.
+    if (causa_tensor_numel(key) < key_dim) return -1;
+
+    float* key_data = (float*)key->data;
 
     for (int64_t i = 0; i < cap; i++) {
         causa_memory_slot_t* slot = mem->slots[level][i];
@@ -162,9 +186,15 @@ static int64_t memory_find_weakest_slot(causa_memory_t* mem, causa_memory_level_
 }
 
 static float memory_compute_similarity(causa_memory_t* mem, causa_tensor_t* key, causa_tensor_t* slot_key) {
+    if (!key || !slot_key) return 0.0f;
+
+    int64_t dim = mem->config.key_dim;
+
+    // Both are read up to the width of a key, so both have to be that wide.
+    if (causa_tensor_numel(key) < dim || causa_tensor_numel(slot_key) < dim) return 0.0f;
+
     float* key_data = (float*)key->data;
     float* slot_data = (float*)slot_key->data;
-    int64_t dim = mem->config.key_dim;
 
     float dot = 0.0f, norm_key = 0.0f, norm_slot = 0.0f;
     for (int64_t i = 0; i < dim; i++) {
@@ -185,6 +215,13 @@ causa_tensor_t* causa_memory_write(
     causa_memory_level_t level
 ) {
     if (!mem || !key || !value || level >= CAUSA_MEMORY_MAX_LEVELS) return NULL;
+
+    // The key and the value are copied into slots of a fixed width, so they
+    // have to be that wide. A key that is narrower would leave the rest of
+    // the slot holding whatever the arena had, and the memory would hold a
+    // value that was never written.
+    if (causa_tensor_numel(key) != mem->config.key_dim) return NULL;
+    if (causa_tensor_numel(value) != mem->config.value_dim) return NULL;
 
     int64_t existing = memory_find_slot(mem, level, key);
     causa_memory_slot_t* slot;
@@ -223,8 +260,22 @@ causa_tensor_t* causa_memory_write(
     slot->access_count = 0;
     slot->occupied = true;
 
+    // The rule is applied to a weight of its own. The key is what the
+    // memory is looked up by, so a rule that changed it would make the
+    // next write of the same key miss and fill the memory with copies of
+    // the same thing.
     if (mem->plasticity_rules[level]) {
-        causa_plasticity_apply(mem->plasticity_rules[level], key, value, slot->key);
+        if (!slot->weight) {
+            causa_tensor_options_t wopts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+            wopts.dtype = CAUSA_DTYPE_F32;
+            wopts.device = CAUSA_DEVICE_CPU;
+            wopts.requires_grad = mem->config.differentiable;
+            int64_t weight_shape[] = {mem->config.key_dim};
+            slot->weight = causa_tensor_new(mem->arena, mem->backend, weight_shape, 1, &wopts);
+        }
+        if (slot->weight) {
+            causa_plasticity_apply(mem->plasticity_rules[level], key, value, slot->weight);
+        }
     }
 
     return slot->value;
@@ -261,21 +312,27 @@ causa_tensor_t* causa_memory_read_topk(
     int64_t cap = mem->config.capacity[level];
     int64_t valid_count = 0;
 
+    // The similarities are held in a buffer of this call's own. A buffer
+    // shared by the whole memory would be written by two calls at once,
+    // and the two would mix their numbers together.
+    float* sims = (float*)malloc((size_t)(cap > 0 ? cap : 1) * sizeof(float));
+    if (!sims) return NULL;
+
     for (int64_t i = 0; i < cap; i++) {
         causa_memory_slot_t* slot = mem->slots[level][i];
         if (slot->occupied && slot->key) {
             float sim = memory_compute_similarity(mem, key, slot->key);
-            ((float*)mem->similarity_buffer->data)[valid_count] = sim;
+            sims[valid_count] = sim;
             valid_count++;
         }
     }
 
-    if (valid_count == 0) return NULL;
+    if (valid_count == 0) { free(sims); return NULL; }
 
     int32_t actual_k = (k < valid_count) ? k : (int32_t)valid_count;
 
-    float* sims = (float*)mem->similarity_buffer->data;
-    int64_t* indices = (int64_t*)causa_arena_alloc(mem->arena, sizeof(int64_t) * valid_count, CAUSA_ALIGNOF(int64_t));
+    int64_t* indices = (int64_t*)malloc((size_t)valid_count * sizeof(int64_t));
+    if (!indices) { free(sims); return NULL; }
     for (int64_t i = 0; i < valid_count; i++) indices[i] = i;
 
     for (int32_t i = 0; i < actual_k; i++) {
@@ -315,6 +372,9 @@ causa_tensor_t* causa_memory_read_topk(
             slot_idx++;
         }
     }
+
+    free(indices);
+    free(sims);
 
     return out_values ? out_values[0] : NULL;
 }
@@ -498,6 +558,11 @@ causa_plasticity_rule_t* causa_plasticity_rule_new(
 
 static void plasticity_hebbian(causa_plasticity_rule_t* rule, causa_tensor_t* pre, causa_tensor_t* post, causa_tensor_t* weight) {
     int64_t n = causa_tensor_numel(pre);
+
+    // All three are read and written up to the length of the first one, so
+    // all three have to be that long.
+    if (causa_tensor_numel(post) < n || causa_tensor_numel(weight) < n) return;
+
     float* pre_data = (float*)pre->data;
     float* post_data = (float*)post->data;
     float* weight_data = (float*)weight->data;
@@ -510,21 +575,34 @@ static void plasticity_hebbian(causa_plasticity_rule_t* rule, causa_tensor_t* pr
 
 static void plasticity_oja(causa_plasticity_rule_t* rule, causa_tensor_t* pre, causa_tensor_t* post, causa_tensor_t* weight) {
     int64_t n = causa_tensor_numel(pre);
+
+    // All three are read and written up to the length of the first one, so
+    // all three have to be that long.
+    if (causa_tensor_numel(post) < n || causa_tensor_numel(weight) < n) return;
+
     float* pre_data = (float*)pre->data;
     float* post_data = (float*)post->data;
     float* weight_data = (float*)weight->data;
 
+    // The output of the weights is the same for every element, so it is
+    // worked out once and not once per element.
+    float y = 0.0f;
+    for (int64_t j = 0; j < n; j++) {
+        y += weight_data[j] * pre_data[j];
+    }
+
     for (int64_t i = 0; i < n; i++) {
-        float y = 0.0f;
-        for (int64_t j = 0; j < n; j++) {
-            y += weight_data[j] * pre_data[j];
-        }
         weight_data[i] += rule->learning_rate * (post_data[i] * pre_data[i] - y * y * weight_data[i]);
     }
 }
 
 static void plasticity_bcm(causa_plasticity_rule_t* rule, causa_tensor_t* pre, causa_tensor_t* post, causa_tensor_t* weight) {
     int64_t n = causa_tensor_numel(pre);
+
+    // All three are read and written up to the length of the first one, so
+    // all three have to be that long.
+    if (causa_tensor_numel(post) < n || causa_tensor_numel(weight) < n) return;
+
     float* pre_data = (float*)pre->data;
     float* post_data = (float*)post->data;
     float* weight_data = (float*)weight->data;
@@ -545,9 +623,14 @@ static void plasticity_ewc(causa_plasticity_rule_t* rule, causa_tensor_t* pre, c
     int64_t n = causa_tensor_numel(weight);
     float* weight_data = (float*)weight->data;
 
+    // The parameters hold the Fisher information and then the previous
+    // weights, so there have to be two of each. Without them the rule
+    // would read past the end of what it was given.
+    bool have_params = rule->params && rule->params_size >= (size_t)(2 * n * sizeof(float));
+
     for (int64_t i = 0; i < n; i++) {
-        float fisher = (float*)rule->params ? ((float*)rule->params)[i] : 1.0f;
-        float target = (float*)rule->params ? ((float*)rule->params)[n + i] : weight_data[i];
+        float fisher = have_params ? ((const float*)rule->params)[i] : 1.0f;
+        float target = have_params ? ((const float*)rule->params)[n + i] : weight_data[i];
         weight_data[i] -= rule->learning_rate * fisher * (weight_data[i] - target);
     }
 }
@@ -557,14 +640,23 @@ static void plasticity_synaptic_scaling(causa_plasticity_rule_t* rule, causa_ten
     // activities are not used.
     (void)pre; (void)post;
     int64_t n = causa_tensor_numel(weight);
+    if (n <= 0) return;
+
     float* weight_data = (float*)weight->data;
 
     float mean_weight = 0.0f;
     for (int64_t i = 0; i < n; i++) mean_weight += weight_data[i];
-    mean_weight /= n;
+    mean_weight /= (float)n;
 
     float target_mean = rule->threshold > 0 ? rule->threshold : 1.0f;
-    float scale = target_mean / (mean_weight + 1e-8f);
+
+    // The mean of the weights may be negative, and a scale that is computed
+    // from it would then turn every weight around. The sign of the weights
+    // is kept, and only their size is changed.
+    float scale = 1.0f;
+    if (fabsf(mean_weight) > 1e-8f) {
+        scale = target_mean / fabsf(mean_weight);
+    }
 
     for (int64_t i = 0; i < n; i++) {
         weight_data[i] *= scale;
@@ -596,6 +688,11 @@ void causa_plasticity_apply(
             plasticity_synaptic_scaling(rule, pre, post, weight);
             break;
         default:
+            // The spike timing rule and the neurogenesis rule are declared
+            // but have no meaning in this model: the first needs the time
+            // a spike happened and the second needs room to be made. They
+            // are listed in the header so that they are not mistaken for
+            // something that works.
             break;
     }
 }
@@ -608,14 +705,34 @@ void causa_plasticity_apply_batch(
 ) {
     if (!rule || !pre_batch || !post_batch || !weight) return;
 
+    // The batch is a matrix, and its size divides the count of elements to
+    // find the width of one row. A batch with no rows has nothing to divide
+    // by.
+    if (pre_batch->ndim < 1 || post_batch->ndim < 1) return;
+
     int64_t batch_size = pre_batch->shape[0];
-    int64_t pre_dim = causa_tensor_numel(pre_batch) / batch_size;
-    int64_t post_dim = causa_tensor_numel(post_batch) / batch_size;
+    if (batch_size <= 0) return;
+
+    int64_t pre_total = causa_tensor_numel(pre_batch);
+    int64_t post_total = causa_tensor_numel(post_batch);
+    if (pre_total % batch_size != 0 || post_total % batch_size != 0) return;
+
+    int64_t pre_dim = pre_total / batch_size;
+    int64_t post_dim = post_total / batch_size;
 
     for (int64_t b = 0; b < batch_size; b++) {
         causa_tensor_t* pre = causa_tensor_slice(pre_batch, (int64_t[]){b, 0}, (int64_t[]){b+1, pre_dim}, NULL, 2);
         causa_tensor_t* post = causa_tensor_slice(post_batch, (int64_t[]){b, 0}, (int64_t[]){b+1, post_dim}, NULL, 2);
+        if (!pre || !post) {
+            // The views are made in the arena, which is never given back,
+            // so they are released as they are used.
+            if (pre) causa_tensor_release(pre);
+            if (post) causa_tensor_release(post);
+            return;
+        }
         causa_plasticity_apply(rule, pre, post, weight);
+        causa_tensor_release(pre);
+        causa_tensor_release(post);
     }
 }
 
@@ -789,8 +906,11 @@ int64_t causa_memory_collect(
     int64_t count = causa_memory_size(mem, level);
     if (count <= 0) return 0;
 
-    // The output must be a matrix with one row per observation
+    // The output must be a matrix with one row per observation. The number
+    // of rows is checked as well as the number of columns, because a matrix
+    // with too few rows would be written past its end.
     if (out->ndim != 2 || out->shape[1] != dim) return -1;
+    if (out->shape[0] < count) return -1;
 
     float* dst = (float*)out->data;
     int64_t row = 0;
@@ -823,6 +943,12 @@ causa_tensor_t* causa_memory_store_causal_law(
     if (causa_tensor_numel(parent_mask) < dim) return NULL;
     if (causa_tensor_numel(coefficients) < dim) return NULL;
 
+    // The law is read back one coefficient per variable, so the value has
+    // to be as wide as the key. A memory whose values are narrower cannot
+    // hold the law, and saying so is better than holding a law that has
+    // lost some of its coefficients.
+    if (mem->config.value_dim < dim) return NULL;
+
     // Build the role vector: 2 marks the child, 1 marks each parent.
     causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
     opts.dtype = CAUSA_DTYPE_F32;
@@ -841,7 +967,10 @@ causa_tensor_t* causa_memory_store_causal_law(
         r[child] = 2.0f;
     }
 
-    causa_tensor_t* slot_value = causa_tensor_new(mem->arena, mem->backend, shape, 1, &opts);
+    // The value is as wide as the memory's values are, so that it is
+    // stored like any other value.
+    int64_t value_shape[] = {mem->config.value_dim};
+    causa_tensor_t* slot_value = causa_tensor_new(mem->arena, mem->backend, value_shape, 1, &opts);
     if (!slot_value) return NULL;
     causa_tensor_copy(slot_value, coefficients);
 
@@ -882,9 +1011,26 @@ int32_t causa_memory_count_causal_laws(
     const causa_memory_t* mem,
     int32_t child
 ) {
-    causa_tensor_t* values[64];
-    int32_t n = causa_memory_find_causal_laws(mem, child, values, 64);
-    return n < 0 ? 0 : n;
+    if (!mem) return 0;
+
+    int64_t dim = mem->config.key_dim;
+    int64_t cap = mem->config.capacity[CAUSA_MEMORY_SEMANTIC];
+    if (child < 0 || child >= dim) return 0;
+
+    // The laws are counted where they are, rather than through a list that
+    // has room for a fixed number of them. A count that stops at the size
+    // of the list would say that a child has fewer laws than it has.
+    int32_t count = 0;
+    for (int64_t i = 0; i < cap; i++) {
+        causa_tensor_t* key = NULL;
+        causa_tensor_t* value = NULL;
+        if (!causa_memory_slot_tensors(mem, CAUSA_MEMORY_SEMANTIC, i, &key, &value)) continue;
+
+        const float* k = (const float*)key->data;
+        if (k[child] != 2.0f) continue;
+        count++;
+    }
+    return count;
 }
 
 int32_t causa_memory_find_causal_law_entries(
@@ -1034,11 +1180,13 @@ int32_t causa_memory_find_procedures(
 
     int64_t cap = mem->config.capacity[CAUSA_MEMORY_PROCEDURAL];
 
-    // The distances go in the shared buffer, which is as large as the
-    // biggest level.
-    float* distances = (float*)mem->similarity_buffer->data;
-    int64_t* slots = (int64_t*)causa_arena_alloc(mem->arena, sizeof(int64_t) * cap, CAUSA_ALIGNOF(int64_t));
-    if (!slots) return -1;
+    // The distances go in a buffer of this call's own. A buffer shared by
+    // the whole memory would be written by two calls at once, and the two
+    // would mix their numbers together. The call is also allowed to change
+    // the memory it is given, so it must not write to it.
+    float* distances = (float*)malloc((size_t)(cap > 0 ? cap : 1) * sizeof(float));
+    int64_t* slots = (int64_t*)malloc((size_t)(cap > 0 ? cap : 1) * sizeof(int64_t));
+    if (!distances || !slots) { free(distances); free(slots); return -1; }
 
     int64_t found = 0;
     for (int64_t i = 0; i < cap; i++) {
@@ -1052,7 +1200,7 @@ int32_t causa_memory_find_procedures(
         found++;
     }
 
-    if (found == 0) return 0;
+    if (found == 0) { free(distances); free(slots); return 0; }
 
     int32_t actual = (max_procedures < found) ? max_procedures : (int32_t)found;
     memory_select_nearest(distances, cap, actual, slots);
@@ -1062,6 +1210,9 @@ int32_t causa_memory_find_procedures(
         out_triggers[i] = slot->key;
         out_actions[i] = slot->value;
     }
+
+    free(distances);
+    free(slots);
 
     return actual;
 }
@@ -1142,6 +1293,141 @@ int32_t causa_memory_learn_procedures(
     return total;
 }
 
+// ===== Counterfactuals in memory =====
+
+int32_t causa_memory_keep_counterfactual(
+    causa_memory_t* mem,
+    const char* query_name,
+    const causa_tensor_t* context,
+    const causa_tensor_t* result
+) {
+    if (!mem || !query_name || !context || !result) return -1;
+    if (mem->capacity_counterfactuals <= 0) return -1;
+
+    int64_t dim = mem->config.key_dim;
+    if (causa_tensor_numel(context) < dim) return -1;
+
+    // The room is full, so the oldest goes. What was learned first is the
+    // least useful once there is more.
+    //
+    // The tensors of the one that goes are kept and used again, so that the
+    // memory does not grow for every counterfactual that is kept.
+    causa_tensor_t* spare_context = NULL;
+    causa_tensor_t* spare_result = NULL;
+    if (mem->num_counterfactuals >= mem->capacity_counterfactuals) {
+        causa_memory_counterfactual_t* dropped = &mem->counterfactuals[0];
+        spare_context = dropped->context;
+        spare_result = dropped->result;
+        dropped->context = NULL;
+        dropped->result = NULL;
+        memmove(&mem->counterfactuals[0], &mem->counterfactuals[1],
+                sizeof(causa_memory_counterfactual_t) * (size_t)(mem->capacity_counterfactuals - 1));
+        mem->num_counterfactuals--;
+    }
+
+    causa_memory_counterfactual_t* entry = &mem->counterfactuals[mem->num_counterfactuals];
+
+    // The context and the result are copied, so the caller keeps its own
+    // tensors and can change them afterwards.
+    causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
+    opts.dtype = CAUSA_DTYPE_F32;
+    opts.device = CAUSA_DEVICE_CPU;
+
+    int64_t shape[] = {dim};
+    entry->context = spare_context ? spare_context : causa_tensor_new(mem->arena, mem->backend, shape, 1, &opts);
+    entry->result = spare_result ? spare_result : causa_tensor_new(mem->arena, mem->backend, shape, 1, &opts);
+    if (!entry->context || !entry->result) {
+        entry->context = NULL;
+        entry->result = NULL;
+        return -1;
+    }
+
+    causa_tensor_copy(entry->context, context);
+    causa_tensor_copy(entry->result, result);
+
+    strncpy(entry->query_name, query_name, CAUSA_MAX_NAME - 1);
+    entry->query_name[CAUSA_MAX_NAME - 1] = '\0';
+    entry->timestamp = mem->global_time;
+
+    mem->num_counterfactuals++;
+    return mem->num_counterfactuals;
+}
+
+int32_t causa_memory_find_counterfactuals(
+    const causa_memory_t* mem,
+    const char* query_name,
+    const causa_tensor_t* context,
+    int32_t max_results,
+    causa_tensor_t** out_results
+) {
+    if (!mem || !query_name || !context || max_results <= 0 || !out_results) return -1;
+
+    int64_t dim = mem->config.key_dim;
+    if (causa_tensor_numel(context) < dim) return -1;
+
+    const float* ctx = (const float*)context->data;
+
+    // The counterfactuals about the variable, with their distance from the
+    // given situation.
+    int32_t found = 0;
+    float* distances = (float*)malloc(sizeof(float) * (size_t)(mem->num_counterfactuals ? mem->num_counterfactuals : 1));
+    int32_t* indices = (int32_t*)malloc(sizeof(int32_t) * (size_t)(mem->num_counterfactuals ? mem->num_counterfactuals : 1));
+    if (!distances || !indices) {
+        free(distances);
+        free(indices);
+        return -1;
+    }
+
+    for (int32_t i = 0; i < mem->num_counterfactuals; i++) {
+        const causa_memory_counterfactual_t* entry = &mem->counterfactuals[i];
+        if (strcmp(entry->query_name, query_name) != 0) continue;
+        if (!entry->context || !entry->result) continue;
+
+        const float* c = (const float*)entry->context->data;
+        float total = 0.0f;
+        for (int64_t j = 0; j < dim; j++) {
+            // A dimension that was not observed is left out of the distance,
+            // the same way the prediction leaves it out. A distance that
+            // counted it would be a number that is not a number, and the
+            // order of the counterfactuals would be decided by it.
+            if (isnan(ctx[j]) || isnan(c[j])) continue;
+            float diff = ctx[j] - c[j];
+            total += diff * diff;
+        }
+        distances[found] = total;
+        indices[found] = i;
+        found++;
+    }
+
+    // The nearest ones first.
+    //
+    // The distances are held in the order the counterfactuals were found,
+    // so the comparison uses the position in that list and not the index of
+    // the counterfactual. Using the index would read past the end of the
+    // distances whenever a counterfactual that does not match came first.
+    for (int32_t i = 0; i < found; i++) {
+        int32_t best = i;
+        for (int32_t j = i + 1; j < found; j++) {
+            if (distances[j] < distances[best]) best = j;
+        }
+        float tmp_d = distances[i];
+        distances[i] = distances[best];
+        distances[best] = tmp_d;
+        int32_t tmp_i = indices[i];
+        indices[i] = indices[best];
+        indices[best] = tmp_i;
+    }
+
+    int32_t count = found < max_results ? found : max_results;
+    for (int32_t i = 0; i < count; i++) {
+        out_results[i] = mem->counterfactuals[indices[i]].result;
+    }
+
+    free(distances);
+    free(indices);
+    return count;
+}
+
 // ===== Reasoning over memory =====
 
 // The learned structure of a variable: which variables are its parents and
@@ -1168,23 +1454,34 @@ static bool memory_collect_law(
     int64_t dim = mem->config.key_dim;
     if (child < 0 || child >= dim) return false;
 
-    causa_tensor_t* keys[16];
-    causa_tensor_t* values[16];
-    int32_t n = causa_memory_find_causal_law_entries(mem, child, keys, values, 16);
-    if (n <= 0) return false;
+    // Every law of the child is looked at. A list with room for a fixed
+    // number of them would leave the rest unseen, and the law that was
+    // missed might be the one with the most parents.
+    int64_t cap = mem->config.capacity[CAUSA_MEMORY_SEMANTIC];
+    if (cap <= 0) return false;
+
+    causa_tensor_t** keys = (causa_tensor_t**)malloc((size_t)cap * sizeof(causa_tensor_t*));
+    causa_tensor_t** values = (causa_tensor_t**)malloc((size_t)cap * sizeof(causa_tensor_t*));
+    if (!keys || !values) { free(keys); free(values); return false; }
+
+    int32_t n = causa_memory_find_causal_law_entries(mem, child, keys, values, (int32_t)cap);
+    if (n <= 0) { free(keys); free(values); return false; }
 
     bool have = false;
 
     for (int32_t e = 0; e < n; e++) {
         const float* role = (const float*)keys[e]->data;
         const float* coeff = (const float*)values[e]->data;
+        int64_t vdim = causa_tensor_numel(values[e]);
 
         memory_law_t candidate;
         memset(&candidate, 0, sizeof(candidate));
         candidate.child = child;
         candidate.found = true;
 
-        for (int64_t j = 0; j < dim && candidate.num_parents < 64; j++) {
+        // The coefficient of a parent is read from the value, so the value
+        // has to be wide enough for it.
+        for (int64_t j = 0; j < dim && j < vdim && candidate.num_parents < 64; j++) {
             // The role vector marks the child with 2 and the parents with 1.
             if (role[j] == 1.0f) {
                 candidate.parents[candidate.num_parents] = (int32_t)j;
@@ -1199,6 +1496,8 @@ static bool memory_collect_law(
         }
     }
 
+    free(keys);
+    free(values);
     return have;
 }
 
@@ -1206,9 +1505,13 @@ static bool memory_collect_law(
 //
 // The laws come out of the discovery step, which enforces acyclicity, so the
 // order always exists. A cycle would mean the discovery produced something
-// inconsistent, in which case the remaining variables are appended in index
-// order and the prediction falls back to what can be worked out.
-static void memory_order_variables(
+// inconsistent. The order is then not complete: the variables that take
+// part in the cycle are left out, so that the caller can tell that the
+// prediction cannot be worked out rather than being given a number that is
+// not a number.
+//
+// The number of variables that were placed is returned.
+static int32_t memory_order_variables(
     const memory_law_t* laws,
     int32_t num_variables,
     int32_t* order
@@ -1219,7 +1522,7 @@ static void memory_order_variables(
         free(pending);
         free(placed);
         for (int32_t i = 0; i < num_variables; i++) order[i] = i;
-        return;
+        return num_variables;
     }
 
     for (int32_t i = 0; i < num_variables; i++) {
@@ -1236,15 +1539,10 @@ static void memory_order_variables(
         }
 
         if (chosen < 0) {
-            // A cycle, or a variable whose parent is missing. Take the first
-            // one that is still unplaced so the order stays complete.
-            for (int32_t i = 0; i < num_variables; i++) {
-                if (!placed[i]) {
-                    chosen = i;
-                    break;
-                }
-            }
-            if (chosen < 0) break;
+            // A cycle, or a variable whose parent is missing. The
+            // variables that take part in it are left out of the order, so
+            // that the caller can tell that they cannot be worked out.
+            break;
         }
 
         placed[chosen] = true;
@@ -1264,6 +1562,7 @@ static void memory_order_variables(
 
     free(pending);
     free(placed);
+    return written;
 }
 
 // The residual of an episode: what the law does not explain.
@@ -1329,9 +1628,11 @@ static int32_t memory_nearest_episodes(
 ) {
     int64_t cap = mem->config.capacity[CAUSA_MEMORY_EPISODIC];
 
-    // The distances go in the shared buffer, which is as large as the
-    // biggest level.
-    float* distances = (float*)mem->similarity_buffer->data;
+    // The distances go in a buffer of this call's own. A buffer shared by
+    // the whole memory would be written by two calls at once, and the two
+    // would mix their numbers together.
+    float* distances = (float*)malloc((size_t)(cap > 0 ? cap : 1) * sizeof(float));
+    if (!distances) return 0;
     int64_t found = 0;
 
     for (int64_t i = 0; i < cap; i++) {
@@ -1352,7 +1653,7 @@ static int32_t memory_nearest_episodes(
         found++;
     }
 
-    if (found == 0) return 0;
+    if (found == 0) { free(distances); return 0; }
 
     int32_t actual = (MEMORY_NEAREST_EPISODES < found) ? MEMORY_NEAREST_EPISODES : (int32_t)found;
 
@@ -1365,6 +1666,8 @@ static int32_t memory_nearest_episodes(
         float tmp = distances[i]; distances[i] = distances[best]; distances[best] = tmp;
         int64_t slot = out_slots[i]; out_slots[i] = out_slots[best]; out_slots[best] = slot;
     }
+
+    free(distances);
 
     return actual;
 }
@@ -1404,12 +1707,15 @@ int32_t causa_memory_predict(
     for (int64_t j = 0; j < dim; j++) {
         memory_collect_law(mem, (int32_t)j, &laws[j]);
     }
-    memory_order_variables(laws, (int32_t)dim, order);
+    int32_t ordered = memory_order_variables(laws, (int32_t)dim, order);
 
     // The offset comes from the episodes in episodic memory.
     int64_t episodic_cap = mem->config.capacity[CAUSA_MEMORY_EPISODIC];
 
-    for (int32_t oi = 0; oi < dim; oi++) {
+    // Only the variables that are in the order are worked out. A variable
+    // that is not in it depends on a variable that depends on it, so there
+    // is no order to work it out in and it is left as it was.
+    for (int32_t oi = 0; oi < ordered; oi++) {
         int32_t c = order[oi];
         if (observed[c]) continue;
 
@@ -1475,12 +1781,20 @@ int32_t causa_memory_predict(
         predicted++;
     }
 
+    // A value that is not a number is a value that could not be worked
+    // out. The laws are in a cycle, so a variable depends on a variable
+    // that depends on it. The prediction is reported as a failure rather
+    // than as a number that is not a number.
+    bool failed = false;
     for (int64_t j = 0; j < dim; j++) {
+        if (!observed[j] && isnan(values[j])) {
+            failed = true;
+        }
         dst[j] = values[j];
     }
 
     free(observed); free(values); free(laws); free(order);
-    return predicted;
+    return failed ? -1 : predicted;
 }
 
 int32_t causa_memory_predict_variable(
@@ -1534,21 +1848,24 @@ int32_t causa_memory_plan_intervention(
     const float* gd = (const float*)goal->data;
     float* od = (float*)out->data;
 
-    // The goal names the variable to be changed: it holds the wanted value,
-    // and the other entries are not wanted.
-    int32_t target = -1;
+    // The goal names the variables to be changed: each holds a wanted value,
+    // and the others are not wanted.
+    int32_t targets[CAUSA_MAX_VARIABLES];
+    float wanted[CAUSA_MAX_VARIABLES];
+    int32_t num_targets = 0;
     for (int64_t j = 0; j < dim; j++) {
-        if (!isnan(gd[j])) {
-            if (target >= 0) return -1;  // only one goal at a time
-            target = (int32_t)j;
-        }
+        if (isnan(gd[j])) continue;
+        if (num_targets >= CAUSA_MAX_VARIABLES) return -1;
+        targets[num_targets] = (int32_t)j;
+        wanted[num_targets] = gd[j];
+        num_targets++;
     }
-    if (target < 0) return -1;
+    if (num_targets == 0) return -1;
 
     for (int64_t j = 0; j < dim; j++) od[j] = 0.0f;
     if (out_count) *out_count = 0;
 
-    // Where the goal variable stands now, according to what is known.
+    // Where the goal variables stand now, according to what is known.
     causa_tensor_options_t opts = CAUSA_TENSOR_OPTIONS_DEFAULTS;
     opts.dtype = CAUSA_DTYPE_F32;
     opts.device = CAUSA_DEVICE_CPU;
@@ -1560,55 +1877,162 @@ int32_t causa_memory_plan_intervention(
 
     float* ob = (float*)observation->data;
     for (int64_t j = 0; j < dim; j++) {
-        // The goal variable is left out, so that it is predicted from what
-        // is known rather than read off the state.
-        ob[j] = (j == target) ? NAN : sd[j];
+        // The goal variables are left out, so that they are predicted from
+        // what is known rather than read off the state.
+        bool wanted_now = false;
+        for (int32_t t = 0; t < num_targets; t++) {
+            if (targets[t] == (int32_t)j) { wanted_now = true; break; }
+        }
+        ob[j] = wanted_now ? NAN : sd[j];
     }
 
     if (causa_memory_predict(mem, observation, prediction) < 0) return -1;
+    const float* pd = (const float*)prediction->data;
 
-    float current = ((const float*)prediction->data)[target];
-    float wanted = gd[target];
-    if (isnan(current)) return -1;
-
-    float change = wanted - current;
-    if (fabsf(change) < 1e-6f) return 0;
-
-    // The law of the goal variable says what moves it.
-    memory_law_t law;
-    if (!memory_collect_law(mem, target, &law)) {
-        // Without a law the variable is exogenous, so it can be set
-        // directly.
-        od[target] = change;
-        if (out_count) *out_count = 1;
-        return 0;
+    // The law of each variable says what moves it.
+    memory_law_t* laws = (memory_law_t*)calloc((size_t)dim, sizeof(memory_law_t));
+    if (!laws) return -1;
+    for (int64_t j = 0; j < dim; j++) {
+        memory_collect_law(mem, (int32_t)j, &laws[j]);
     }
 
-    if (law.num_parents == 0) {
-        od[target] = change;
-        if (out_count) *out_count = 1;
-        return 0;
+    // The variables that can be acted on.
+    //
+    // For each goal the strongest cause is the one acted on, because it
+    // moves the goal the most for the least change. A goal with no cause
+    // is exogenous, so it is set directly.
+    int32_t* candidates = (int32_t*)calloc((size_t)dim, sizeof(int32_t));
+    int32_t num_candidates = 0;
+    if (!candidates) { free(laws); return -1; }
+
+    for (int32_t t = 0; t < num_targets; t++) {
+        int32_t g = targets[t];
+        const memory_law_t* law = &laws[g];
+
+        int32_t action = -1;
+        if (law->found && law->num_parents > 0) {
+            float best = 0.0f;
+            for (int32_t p = 0; p < law->num_parents; p++) {
+                float magnitude = fabsf(law->coefficients[p]);
+                if (magnitude > best) {
+                    best = magnitude;
+                    action = law->parents[p];
+                }
+            }
+        } else {
+            action = g;
+        }
+
+        if (action < 0 || action >= dim) continue;
+
+        bool known = false;
+        for (int32_t c = 0; c < num_candidates; c++) {
+            if (candidates[c] == action) { known = true; break; }
+        }
+        if (!known) candidates[num_candidates++] = action;
     }
 
-    // The strongest cause is the one that is acted on: it moves the goal
-    // the most for the least change.
-    int32_t strongest = -1;
-    float best = 0.0f;
-    for (int32_t p = 0; p < law.num_parents; p++) {
-        float magnitude = fabsf(law.coefficients[p]);
-        if (magnitude > best) {
-            best = magnitude;
-            strongest = p;
+    // The effect of each action on each goal.
+    //
+    // A change to a variable moves everything downstream of it, so the
+    // effect is the sum over the paths from the action to the goal of the
+    // product of the coefficients along the path. The matrix is worked out
+    // in the order the variables come in, so that a parent is settled
+    // before the child that depends on it.
+    float* effects = (float*)calloc((size_t)dim * (size_t)num_candidates, sizeof(float));
+    if (!effects) { free(laws); free(candidates); return -1; }
+
+    for (int32_t c = 0; c < num_candidates; c++) {
+        // An action changes the variable it is applied to.
+        effects[candidates[c] * num_candidates + c] = 1.0f;
+    }
+
+    int32_t* order = (int32_t*)calloc((size_t)dim, sizeof(int32_t));
+    if (!order) { free(laws); free(candidates); free(effects); return -1; }
+    memory_order_variables(laws, (int32_t)dim, order);
+
+    for (int32_t oi = 0; oi < dim; oi++) {
+        int32_t v = order[oi];
+        const memory_law_t* law = &laws[v];
+        if (!law->found) continue;
+
+        for (int32_t p = 0; p < law->num_parents; p++) {
+            int32_t parent = law->parents[p];
+            if (parent < 0 || parent >= dim) continue;
+            float coef = law->coefficients[p];
+            for (int32_t c = 0; c < num_candidates; c++) {
+                effects[v * num_candidates + c] += coef * effects[parent * num_candidates + c];
+            }
         }
     }
+    free(order);
 
-    if (strongest < 0 || best < 1e-6f) return 0;
+    // The change each goal needs.
+    float* needed = (float*)calloc((size_t)num_targets, sizeof(float));
+    if (!needed) { free(laws); free(candidates); free(effects); return -1; }
 
-    int32_t parent = law.parents[strongest];
-    if (parent < 0 || parent >= dim) return -1;
+    bool reachable = true;
+    for (int32_t t = 0; t < num_targets; t++) {
+        int32_t g = targets[t];
+        float current = pd[g];
+        if (isnan(current)) { reachable = false; break; }
+        needed[t] = wanted[t] - current;
+    }
 
-    od[parent] = change / law.coefficients[strongest];
-    if (out_count) *out_count = 1;
+    if (!reachable) {
+        free(laws); free(candidates); free(effects); free(needed);
+        return -1;
+    }
+
+    // Solve for the change to each action.
+    //
+    // The goals are solved together, so that a change made for one goal
+    // does not undo another. Where the goals cannot all be reached, the
+    // change that fits them best is given.
+    float* changes = (float*)calloc((size_t)num_candidates, sizeof(float));
+    if (!changes) { free(laws); free(candidates); free(effects); free(needed); return -1; }
+
+    if (num_candidates > 0) {
+        // Only the rows of the goals are used.
+        float* rows = (float*)calloc((size_t)num_targets * (size_t)num_candidates, sizeof(float));
+        float* solution = (float*)calloc((size_t)num_candidates, sizeof(float));
+        if (!rows || !solution) {
+            free(rows); free(solution); free(laws); free(candidates);
+            free(effects); free(needed); free(changes);
+            return -1;
+        }
+
+        for (int32_t t = 0; t < num_targets; t++) {
+            int32_t g = targets[t];
+            for (int32_t c = 0; c < num_candidates; c++) {
+                rows[t * num_candidates + c] = effects[g * num_candidates + c];
+            }
+        }
+
+        if (causa_solve_least_squares(rows, needed, num_targets, num_candidates, solution)) {
+            memcpy(changes, solution, sizeof(float) * (size_t)num_candidates);
+        }
+
+        free(rows);
+        free(solution);
+    }
+
+    // The change to each variable.
+    int32_t count = 0;
+    for (int32_t c = 0; c < num_candidates; c++) {
+        int32_t action = candidates[c];
+        if (fabsf(changes[c]) < 1e-6f) continue;
+        od[action] += changes[c];
+        count++;
+    }
+
+    free(laws);
+    free(candidates);
+    free(effects);
+    free(needed);
+    free(changes);
+
+    if (out_count) *out_count = count;
     return 0;
 }
 

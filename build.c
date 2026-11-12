@@ -417,7 +417,7 @@ bool link_target(build_config_t* cfg) {
         }
 #else
         snprintf(cmd, MAX_CMD_LEN, "%s -o \"%s\"", cfg->cc, output_path);
-        for (int i = 0; i < num_obj_files; i++) {
+        for (int32_t i = 0; i < num_obj_files; i++) {
             char obj_arg[MAX_PATH_LEN];
             snprintf(obj_arg, MAX_PATH_LEN, " \"%s\"", obj_files[i]);
             strncat(cmd, obj_arg, MAX_CMD_LEN - strlen(cmd) - 1);
@@ -427,6 +427,7 @@ bool link_target(build_config_t* cfg) {
         if (cfg->has_cuda) {
             strncat(cmd, " -lcudart -lcublas -lcudnn", MAX_CMD_LEN - strlen(cmd) - 1);
         }
+        strncat(cmd, " -lm", MAX_CMD_LEN - strlen(cmd) - 1);
 #endif
     }
 
